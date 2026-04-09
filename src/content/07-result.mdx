@@ -1,0 +1,47 @@
+import { summaryTable } from '../data/experiments';
+
+<Section title="종합 결과" id="result">
+
+## 비교표
+
+세 번의 실습에서 측정한 주요 지표를 하나의 표로 정리하면 다음과 같다. interrupt와 SQPOLL은 fio로, adaptive는 직접 구현한 C 벤치마크로 측정한 값이다.
+
+| 지표 | fio Interrupt | fio SQPOLL | Adaptive C |
+|------|---------------|------------|------------|
+| 평균 지연 (QD=16) | 118 us | 70 us | 73 us |
+| 처리량 (Idle) | 420 MB/s | 580 MB/s | 560 MB/s |
+| 처리량 (CPU 100%) | 380 MB/s | 340 MB/s | 405 MB/s |
+| CPU 사용률 (QD=16, Idle) | ~13% | ~98% | ~35% |
+| 측정 도구 | fio | fio | C benchmark |
+
+표에서 주목할 점은 두 가지다. 첫째, CPU 사용률이다. fio SQPOLL은 98%로 코어 하나를 사실상 전부 점유하지만, adaptive C는 35%에 그친다. 부하가 낮을 때만 polling을 활성화하고, 부하가 높아지면 interrupt로 전환하기 때문이다. 둘째, CPU 100% 부하에서 adaptive C가 405MB/s로 fio interrupt(380MB/s)와 fio SQPOLL(340MB/s) 모두보다 높은 처리량을 기록했다. adaptive가 부하 상태에 따라 최적 모드를 선택한 결과다.
+
+## 언제 어떤 모드를 쓸 것인가
+
+<Steps>
+  <Step title="Polling이 유리한 경우">
+
+CPU에 여유가 있고 QD가 높은 환경에서 SQPOLL은 가장 큰 이점을 보인다. 시스템 콜 없이 커널 스레드가 SQ를 직접 확인하므로 제출 지연이 거의 0에 가깝다. 전형적인 사례는 전용 스토리지 서버로, I/O 외에 CPU를 점유하는 작업이 거의 없고 NVMe 장치의 IOPS를 극한까지 끌어내야 하는 환경이다.
+
+  </Step>
+  <Step title="Interrupt가 유리한 경우">
+
+CPU 부하가 높거나 코어 수가 적은 환경에서는 interrupt 모드가 합리적이다. 웹 서버, 데이터베이스, 가상화 호스트처럼 CPU를 다양한 작업에 나누어 써야 하는 경우, SQPOLL의 전용 코어 점유가 오히려 전체 성능을 끌어내린다. CPU 100% 실험에서 fio SQPOLL이 340MB/s로 떨어진 반면 fio interrupt는 380MB/s를 유지한 것이 이를 보여준다.
+
+  </Step>
+  <Step title="Adaptive의 가치">
+
+단일 전략이 모든 시나리오에서 최적인 경우는 없다. Adaptive는 각 시나리오에서 최적 전략 대비 85~97% 수준의 성능을 유지하면서, 최악의 경우를 회피한다. fio SQPOLL이 CPU 100%에서 보여준 340MB/s라는 최저점을 adaptive는 겪지 않으며, idle에서는 fio SQPOLL과 거의 동일한 560MB/s를 달성한다.
+
+  </Step>
+</Steps>
+
+<Callout kind="warn">
+Adaptive C와 fio 결과는 측정 harness가 다르다. fio는 내부적으로 정교한 워크로드 생성과 통계 수집을 수행하는 반면, C 벤치마크는 단순한 루프로 측정한다. 이 표의 값을 절대적으로 비교하기보다, 각 전략의 상대적 특성을 파악하는 데 활용해야 한다.
+</Callout>
+
+<Callout kind="tip">
+전용 스토리지 서버처럼 I/O만 처리하는 환경에서는 SQPOLL 고정이 가장 단순하고 효과적이다. 웹 서버나 데이터베이스처럼 CPU와 I/O를 함께 쓰는 혼합 워크로드에서는 adaptive가 가장 안정적인 성능을 제공한다. 부하 패턴이 예측 가능하다면 고정 모드가, 부하가 시간대별로 변한다면 adaptive가 유리하다.
+</Callout>
+
+</Section>

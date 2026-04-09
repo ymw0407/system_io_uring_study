@@ -1,0 +1,293 @@
+import { fioQdLatency, fioCpuThroughput, fioCpuUsage } from '../data/experiments';
+
+<Section title="실습: fio로 정밀 측정하기" id="week2">
+
+## 이번 실습의 목표
+
+1회차에서 io_uring의 동작을 C 코드로 직접 체험했다. `clock_gettime`으로 대략적인 지연을 찍어 보았지만, 측정 harness 자체가 오버헤드를 만들 수 있고 워밍업이나 정상 상태(steady-state) 판정도 없었다. 이번에는 실험이다. QD를 바꾸고, 모드를 바꾸고, CPU 부하를 바꾸면서 성능이 어떻게 달라지는지 정밀하게 측정한다. 이 매트릭스를 C로 짜면 수백 줄이고, 한 줄 실수하면 전부 다시 돌려야 한다. fio를 쓰면 셸 스크립트 한 장이면 된다.
+
+## 왜 fio인가
+
+fio(Flexible I/O Tester)는 리눅스 블록 I/O 벤치마크의 사실상 표준 도구다. `--ioengine=io_uring`을 지정하면 내부적으로 liburing을 사용하여 io_uring 경로를 정확히 행사하며, SQPOLL과 IOPOLL 같은 세부 모드까지 플래그 하나로 제어할 수 있다. fio는 워밍업, 정상 상태 감지, 백분위 지연 계산, JSON 출력을 자체적으로 처리하므로, C로 직접 구현해야 할 측정 인프라를 통째로 대체한다.
+
+## fio 설치 및 기본 사용법
+
+<Steps>
+  <Step title="fio 설치">
+
+대부분의 배포판에서 패키지 매니저로 설치할 수 있다. io_uring 엔진은 fio 3.13 이상에서 지원된다.
+
+<Terminal title="fio 설치 및 버전 확인" commands={[
+  { cmd: "sudo apt install fio", output: ["Reading package lists...", "Setting up fio (3.36-1) ..."] },
+  { cmd: "fio --version", output: ["fio-3.36"] },
+  { cmd: "fio --enghelp | grep io_uring", output: ["io_uring"] }
+]} />
+
+`fio --enghelp`에서 `io_uring`이 보이면 엔진이 활성화된 빌드다.
+
+  </Step>
+  <Step title="첫 번째 fio 실행">
+
+가장 기본적인 io_uring 랜덤 읽기 명령을 실행한다.
+
+<Terminal title="기본 fio 실행" commands={[
+  { cmd: "fio --name=basic --ioengine=io_uring --rw=randread --bs=4k --direct=1 --iodepth=16 --filename=/dev/nvme0n1 --runtime=10 --time_based --size=1G", output: ["basic: (groupid=0, jobs=1): err= 0: pid=12345", "  read: IOPS=34.2k, BW=133MiB/s (140MB/s)", "    slat (nsec): min=1200, max=52000, avg=2100", "    clat (usec): min=35, max=890, avg=118.2", "     lat (usec): min=37, max=892, avg=120.3"] }
+]} />
+
+`--ioengine=io_uring`은 io_uring 백엔드를 선택한다. `--rw=randread`는 4KB 랜덤 읽기, `--direct=1`은 페이지 캐시를 우회하여 디바이스 지연을 직접 측정한다. `--iodepth=16`은 동시에 16개의 요청을 in-flight 상태로 유지한다. `--time_based`는 지정된 `--runtime` 동안 반복 실행하라는 뜻이다.
+
+출력에서 `clat`(completion latency)의 `avg`가 핵심 지표다. 이 값이 NVMe 4KB random read의 전형적인 범위인 80~120 마이크로초 안에 있으면 정상이다.
+
+  </Step>
+</Steps>
+
+<Callout kind="tip">
+`--direct=1`은 `O_DIRECT` 플래그를 켜서 페이지 캐시를 우회한다. 이 옵션을 빼면 운영체제 캐시에서 데이터를 읽는 비율이 높아져, 디바이스 I/O가 아닌 메모리 접근 속도를 측정하게 된다. 블록 디바이스 성능을 측정할 때는 반드시 켜야 한다.
+</Callout>
+
+## 모드별 fio 옵션
+
+io_uring에는 세 가지 주요 동작 모드가 있다. fio에서 각각을 어떻게 활성화하는지 정리한다.
+
+<Steps>
+  <Step title="Interrupt 모드 (기본)">
+
+추가 플래그 없이 `--ioengine=io_uring`만 지정하면 기본 모드, 즉 interrupt 방식으로 동작한다. 애플리케이션이 `io_uring_enter` 시스템 콜로 요청을 제출하고, 완료 시 커널이 인터럽트를 통해 CQE를 채운다.
+
+<Terminal title="Interrupt 모드" commands={[
+  { cmd: "fio --name=int --ioengine=io_uring --rw=randread --bs=4k --direct=1 --iodepth=16 --filename=/dev/nvme0n1 --runtime=30 --time_based --output-format=json --output=results/default-qd16.json" }
+]} />
+
+  </Step>
+  <Step title="SQPOLL 모드">
+
+`--sqthread_poll=1`을 추가하면 fio 내부에서 `IORING_SETUP_SQPOLL` 플래그를 설정한다. 커널이 전용 kthread를 생성하여 SQ를 지속적으로 감시하므로, 제출 경로의 시스템 콜이 제거된다.
+
+<Terminal title="SQPOLL 모드" commands={[
+  { cmd: "sudo fio --name=sqpoll --ioengine=io_uring --sqthread_poll=1 --rw=randread --bs=4k --direct=1 --iodepth=16 --filename=/dev/nvme0n1 --runtime=30 --time_based --output-format=json --output=results/sqpoll-qd16.json" }
+]} />
+
+SQPOLL은 커널 5.12 이전에서는 `CAP_SYS_ADMIN`이 필요하다. 권한 오류가 발생하면 `sudo`로 실행한다.
+
+  </Step>
+  <Step title="IOPOLL 모드">
+
+`--hipri=1`을 추가하면 `IORING_SETUP_IOPOLL` 플래그가 설정된다. 이 모드는 완료 경로를 폴링으로 전환하여, 커널이 디바이스 completion queue를 직접 확인한다. NVMe처럼 polling-capable 디바이스에서만 동작하며, `O_DIRECT`가 필수다.
+
+<Terminal title="IOPOLL 모드" commands={[
+  { cmd: "sudo fio --name=iopoll --ioengine=io_uring --hipri=1 --rw=randread --bs=4k --direct=1 --iodepth=16 --filename=/dev/nvme0n1 --runtime=30 --time_based --output-format=json --output=results/iopoll-qd16.json" }
+]} />
+
+SQPOLL이 제출 경로의 시스템 콜을 제거한다면, IOPOLL은 완료 경로의 인터럽트를 제거한다. 둘은 독립적인 최적화이며 동시에 사용할 수도 있다.
+
+  </Step>
+</Steps>
+
+<Callout kind="note">
+SQPOLL과 IOPOLL을 혼동하기 쉽다. SQPOLL은 커널 스레드가 SQ(Submission Queue)를 감시하여 제출 시스템 콜을 없앤다. IOPOLL은 디바이스 레벨에서 completion을 폴링하여 완료 인터럽트를 없앤다. 제거하는 대상이 다르다.
+</Callout>
+
+## 실험 매트릭스 스크립트
+
+세 모드와 다섯 단계의 QD를 조합하면 총 15회의 실험이 필요하다. 이를 셸 스크립트 하나로 자동화한다.
+
+<CodeBlock language="bash" filename="run_matrix.sh">
+{`#!/bin/bash
+# run_matrix.sh — mode x QD experiment matrix
+# usage: sudo ./run_matrix.sh
+
+MODES=("default" "sqpoll" "iopoll")
+QDS=(1 4 16 64 256)
+DEVICE="/dev/nvme0n1"
+RUNTIME=30
+OUTDIR="results"
+
+mkdir -p "$OUTDIR"
+
+for mode in "\${MODES[@]}"; do
+  EXTRA=""
+  if [ "$mode" = "sqpoll" ]; then
+    EXTRA="--sqthread_poll=1"
+  fi
+  if [ "$mode" = "iopoll" ]; then
+    EXTRA="--hipri=1"
+  fi
+
+  for qd in "\${QDS[@]}"; do
+    echo ">>> Running: mode=$mode qd=$qd"
+    fio --name="\${mode}-qd\${qd}" \\
+        --ioengine=io_uring \\
+        --rw=randread --bs=4k --direct=1 \\
+        --iodepth="$qd" \\
+        --filename="$DEVICE" \\
+        --runtime="$RUNTIME" --time_based \\
+        --output-format=json \\
+        $EXTRA \\
+        --output="\${OUTDIR}/\${mode}-qd\${qd}.json"
+  done
+done
+
+echo "Done. Results in $OUTDIR/"
+ls -1 "$OUTDIR"/*.json | wc -l
+echo "JSON files generated."`}
+</CodeBlock>
+
+<Terminal title="실험 매트릭스 실행" commands={[
+  { cmd: "chmod +x run_matrix.sh && sudo ./run_matrix.sh", output: [">>> Running: mode=default qd=1", ">>> Running: mode=default qd=4", "...", ">>> Running: mode=iopoll qd=256", "Done. Results in results/", "15", "JSON files generated."] }
+]} />
+
+전체 실행에는 약 7분 30초(15회 x 30초)가 소요된다. 각 실험의 결과는 `results/` 디렉터리에 JSON 파일로 저장된다.
+
+## JSON 결과 파싱
+
+fio의 JSON 출력에서 핵심 지표를 추출한다. `jq`를 사용하면 한 줄로 원하는 필드를 뽑을 수 있다.
+
+<Terminal title="단일 파일에서 지표 추출" commands={[
+  { cmd: "jq '.jobs[0].read.lat_ns.mean / 1000' results/default-qd16.json", output: ["118.234"] },
+  { cmd: "jq '.jobs[0].read.iops' results/default-qd16.json", output: ["34215.8"] },
+  { cmd: "jq '{usr: .jobs[0].usr_cpu, sys: .jobs[0].sys_cpu}' results/sqpoll-qd16.json", output: ["{", "  \"usr\": 3.2,", "  \"sys\": 95.1", "}"] }
+]} />
+
+15개 파일을 하나씩 열기보다는 파싱 스크립트로 CSV를 한번에 뽑는 편이 낫다.
+
+<CodeBlock language="bash" filename="parse_results.sh">
+{`#!/bin/bash
+# parse_results.sh — extract key metrics from fio JSON
+# output: CSV to stdout
+
+OUTDIR="results"
+
+echo "mode,qd,lat_us,iops,bw_MBs,usr_cpu,sys_cpu"
+
+for f in "$OUTDIR"/*.json; do
+  base=$(basename "$f" .json)
+  mode=$(echo "$base" | cut -d'-' -f1)
+  qd=$(echo "$base" | sed 's/.*qd//')
+
+  lat=$(jq '.jobs[0].read.lat_ns.mean / 1000' "$f")
+  iops=$(jq '.jobs[0].read.iops' "$f")
+  bw=$(jq '.jobs[0].read.bw_bytes / 1048576' "$f")
+  usr=$(jq '.jobs[0].usr_cpu' "$f")
+  sys=$(jq '.jobs[0].sys_cpu' "$f")
+
+  printf "%s,%s,%.1f,%.0f,%.1f,%.1f,%.1f\\n" \\
+    "$mode" "$qd" "$lat" "$iops" "$bw" "$usr" "$sys"
+done | sort -t, -k1,1 -k2,2n`}
+</CodeBlock>
+
+<Terminal title="CSV 추출" commands={[
+  { cmd: "chmod +x parse_results.sh && ./parse_results.sh", output: ["mode,qd,lat_us,iops,bw_MBs,usr_cpu,sys_cpu", "default,1,95.0,10520,41.1,5.1,8.2", "default,4,102.0,15230,59.5,5.3,8.5", "default,16,118.2,34215,133.7,5.0,8.0", "...", "sqpoll,16,70.1,56820,221.9,3.2,95.1", "...", "iopoll,16,58.3,68410,267.2,12.1,6.0"] }
+]} />
+
+이 CSV를 스프레드시트에 넣으면 그래프를 그릴 수 있고, 아래에서는 이미 추출된 대표 데이터로 시각화한다.
+
+## QD별 지연 비교
+
+세 모드의 QD별 평균 지연을 하나의 그래프로 겹쳐 본다.
+
+<Chart
+  kind="line"
+  data={fioQdLatency}
+  xKey="qd"
+  series={[
+    { key: 'interrupt', label: 'Interrupt', color: 'interrupt' },
+    { key: 'sqpoll', label: 'SQPOLL', color: 'polling' },
+    { key: 'iopoll', label: 'IOPOLL', color: 'adaptive' },
+  ]}
+  xLabel="Queue Depth"
+  yLabel="Latency (us)"
+  caption="QD별 평균 지연: Interrupt vs SQPOLL vs IOPOLL (fio 측정, 4KB randread, NVMe, 예시 데이터)"
+/>
+
+전 구간에서 IOPOLL이 가장 낮은 지연을 보인다. QD=16 기준으로 IOPOLL은 58 마이크로초, SQPOLL은 70 마이크로초, interrupt는 118 마이크로초를 기록한다. SQPOLL은 제출 시스템 콜을 제거하여 interrupt 대비 40% 낮은 지연을 달성하고, IOPOLL은 여기에 완료 인터럽트까지 제거하여 추가로 17% 개선한다.
+
+QD가 높아질수록 interrupt 모드의 지연 상승이 가파르다. QD=256에서 interrupt는 210 마이크로초까지 올라가지만 SQPOLL은 92, IOPOLL은 78 마이크로초에 머문다. QD가 높을수록 시스템 콜과 인터럽트의 누적 비용이 커지기 때문이다. 라인 사이의 보간은 실제 측정 구간 사이의 동작을 보장하지 않으며, 실제 곡선은 디바이스 특성에 따라 달라질 수 있다.
+
+## CPU 사용량 비교
+
+모드별로 fio가 보고하는 CPU 사용률을 확인한다. QD=16, 동일 런타임 조건에서 측정한 값이다.
+
+<Chart
+  kind="bar"
+  data={fioCpuUsage}
+  xKey="mode"
+  series={[
+    { key: 'usrCpu', label: 'User CPU %', color: 'interrupt' },
+    { key: 'sysCpu', label: 'System CPU %', color: 'polling' },
+  ]}
+  xLabel="Mode"
+  yLabel="CPU Usage (%)"
+  caption="모드별 CPU 사용률 (fio 측정, QD=16, 예시 데이터)"
+/>
+
+SQPOLL의 시스템 CPU가 95%에 달하는 것이 눈에 띈다. 커널 스레드가 SQ를 쉬지 않고 폴링하기 때문이다. Interrupt 모드는 합산 13%로 가볍고, IOPOLL은 사용자 공간 폴링 비용으로 usr_cpu가 12%이지만 시스템 CPU는 6%에 불과하다. SQPOLL이 CPU 코어 하나를 거의 전부 점유한다는 사실은 이후 부하 실험에서 중요한 의미를 갖는다.
+
+## CPU 부하 실험
+
+SQPOLL이 CPU 코어 하나를 상시 점유한다면, 다른 작업이 CPU를 두고 경쟁할 때 어떤 일이 벌어지는가. `stress-ng`로 CPU 부하를 단계별로 올리면서 처리량 변화를 측정한다.
+
+<Steps>
+  <Step title="부하 없이 측정 (Idle)">
+
+다른 부하 없이 fio만 실행한다. QD=16을 기준으로 interrupt와 SQPOLL의 처리량을 각각 기록한다.
+
+<Terminal title="Idle 상태 측정" commands={[
+  { cmd: "fio --name=idle-int --ioengine=io_uring --rw=randread --bs=4k --direct=1 --iodepth=16 --filename=/dev/nvme0n1 --runtime=30 --time_based --output-format=json --output=results/cpu-idle-int.json" },
+  { cmd: "sudo fio --name=idle-sqp --ioengine=io_uring --sqthread_poll=1 --rw=randread --bs=4k --direct=1 --iodepth=16 --filename=/dev/nvme0n1 --runtime=30 --time_based --output-format=json --output=results/cpu-idle-sqp.json" }
+]} />
+
+  </Step>
+  <Step title="CPU 50% 부하">
+
+`stress-ng`로 코어 절반에 연산 부하를 건다. 아래 예시는 8코어 시스템 기준이며, 코어 수에 맞게 조정한다.
+
+<Terminal title="CPU 50% 부하 + fio 측정" commands={[
+  { cmd: "stress-ng --cpu 4 --timeout 60s &", output: ["[1] 12345"] },
+  { cmd: "fio --name=cpu50-int --ioengine=io_uring --rw=randread --bs=4k --direct=1 --iodepth=16 --filename=/dev/nvme0n1 --runtime=30 --time_based --output-format=json --output=results/cpu50-int.json" },
+  { cmd: "sudo fio --name=cpu50-sqp --ioengine=io_uring --sqthread_poll=1 --rw=randread --bs=4k --direct=1 --iodepth=16 --filename=/dev/nvme0n1 --runtime=30 --time_based --output-format=json --output=results/cpu50-sqp.json" }
+]} />
+
+  </Step>
+  <Step title="CPU 100% 부하">
+
+모든 코어를 포화시킨다. `$(nproc)`은 시스템의 전체 코어 수로 치환된다.
+
+<Terminal title="CPU 100% 부하 + fio 측정" commands={[
+  { cmd: "stress-ng --cpu $(nproc) --timeout 60s &", output: ["[1] 12350"] },
+  { cmd: "sudo fio --name=cpu100-int --ioengine=io_uring --rw=randread --bs=4k --direct=1 --iodepth=16 --filename=/dev/nvme0n1 --runtime=30 --time_based --output-format=json --output=results/cpu100-int.json" },
+  { cmd: "sudo fio --name=cpu100-sqp --ioengine=io_uring --sqthread_poll=1 --rw=randread --bs=4k --direct=1 --iodepth=16 --filename=/dev/nvme0n1 --runtime=30 --time_based --output-format=json --output=results/cpu100-sqp.json" }
+]} />
+
+  </Step>
+</Steps>
+
+<Chart
+  kind="bar"
+  data={fioCpuThroughput}
+  xKey="cpuLoad"
+  series={[
+    { key: 'interrupt', label: 'Interrupt', color: 'interrupt' },
+    { key: 'sqpoll', label: 'SQPOLL', color: 'polling' },
+  ]}
+  xLabel="CPU Load"
+  yLabel="Throughput (MB/s)"
+  caption="CPU 부하 수준별 처리량 비교, QD=16 (fio 측정, 4KB randread, NVMe, 예시 데이터)"
+/>
+
+Idle 상태에서 SQPOLL은 580MB/s로 interrupt의 420MB/s를 크게 앞선다. CPU 50%에서도 SQPOLL이 510MB/s 대 400MB/s로 우위를 유지한다. 그러나 CPU 100%에서 역전이 발생한다. SQPOLL은 340MB/s로 급락하고, interrupt는 380MB/s를 유지한다.
+
+<Callout kind="checkpoint">
+CPU 100%에서 SQPOLL 처리량이 interrupt보다 낮아지는 것을 확인했다면, 이것이 3회차에서 adaptive가 필요한 이유다. SQPOLL의 커널 스레드는 CPU 코어 하나를 100% 점유하는데, 모든 코어가 포화된 상태에서는 이 스레드가 스케줄러에 의해 빈번히 선점당한다. 폴링의 연속성이 깨지면 시스템 콜 제거의 이점이 사라지고, 스레드 관리 오버헤드만 남는다.
+</Callout>
+
+## 핵심 관찰
+
+이번 실험에서 확인한 사실을 정리하면 세 가지로 요약된다. CPU에 여유가 있을 때 SQPOLL은 시스템 콜 제거 효과로 확실한 우위를 보인다. 그러나 CPU가 포화되면 그 우위가 사라지고 오히려 interrupt보다 못한 결과를 낸다. 어떤 단일 모드도 모든 상황에서 최적이 아니다.
+
+실제 서버 환경에서는 I/O 외에도 쿼리 처리, 네트워크 처리 등 다양한 작업이 CPU를 소비하므로, "항상 폴링"이라는 전략은 성립하지 않는다. 그렇다고 "항상 인터럽트"를 쓰면 CPU가 한가한 시간대의 성능을 버리게 된다. 다음 회차에서는 이 딜레마를 해결하기 위해, CPU 사용률과 QD를 관찰하여 모드를 동적으로 전환하는 adaptive 정책을 C로 직접 구현한다. fio에는 이런 동적 전환 기능이 없으므로, 3회차에서는 다시 C 코드로 돌아가야 한다.
+
+<Callout kind="warn">
+fio와 직접 작성한 C 벤치마크의 결과를 나란히 비교할 때는 주의가 필요하다. fio는 내부적으로 워밍업, 스레드 관리, 통계 수집 등의 인프라가 동작하므로, 동일한 io_uring 모드를 사용하더라도 C 코드의 결과와 미묘하게 다를 수 있다. 3회차에서 adaptive C 벤치마크와 fio 결과를 비교할 때 이 한계를 명시해야 한다.
+</Callout>
+
+</Section>

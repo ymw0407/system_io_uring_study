@@ -1,0 +1,343 @@
+import { adaptiveQdLatency, adaptiveComparison } from '../data/experiments';
+
+<Section title="실습: Adaptive I/O 구현" id="week3">
+
+## 이번 실습의 목표
+
+2회차에서 확인한 핵심 관찰은 polling과 interrupt 어느 한쪽도 모든 상황에서 최적이 아니라는 것이었다. CPU 여유가 있을 때는 SQPOLL이, CPU가 포화되면 interrupt가 우위를 점했다. 이번 실습에서는 시스템 상태를 실시간으로 관찰하여 두 모드를 자동으로 전환하는 adaptive 정책을 직접 C로 구현한다.
+
+## 왜 C로 짜야 하는가
+
+fio는 interrupt, SQPOLL, IOPOLL 같은 고정 모드는 지원하지만, CPU 사용률과 QD를 보고 모드를 동적으로 전환하는 adaptive 정책은 제공하지 않는다. 이 동적 전환 로직이 이 과제에서 유일하게 "새로운 것"이며, 직접 C로 구현해야 하는 이유다. 구현 후에는 fio로 측정한 interrupt/SQPOLL 기준선과 비교하여 adaptive의 효과를 검증한다.
+
+## 정책 설계
+
+정책은 두 가지 신호를 관찰한다. 첫 번째는 `/proc/stat`에서 읽는 CPU 사용률이다. 70%를 넘으면 SQPOLL 스레드가 다른 작업과 CPU를 두고 경쟁하므로 interrupt로 전환한다. 두 번째는 현재 in-flight 요청 수(QD)로, 8 이상이면서 CPU에 여유가 있으면 polling으로 전환한다. 모드 전환 자체에 비용이 있으므로 500밀리초 쿨다운을 두어 진동을 방지한다.
+
+<CodeBlock language="plaintext" filename="adaptive_policy.txt">
+{`every 200ms:
+    cpu_usage = read_cpu_usage_from_proc_stat()
+    current_qd = count_inflight_requests()
+
+    if time_since_last_switch < 500ms:
+        return   // cooldown: do not switch
+
+    if cpu_usage > 70%:
+        switch_to_interrupt_mode()
+    else if current_qd >= 8 and cpu_usage <= 70%:
+        switch_to_polling_mode()
+    // otherwise: keep current mode`}
+</CodeBlock>
+
+## 구현하기
+
+<Steps>
+  <Step title="CPU 사용률 읽기 함수">
+
+`/proc/stat`의 첫 줄은 시스템 전체 CPU 시간을 나타낸다. 두 시점의 값을 비교하면 그 구간의 CPU 사용률을 계산할 수 있다.
+
+<CodeBlock language="c" filename="cpu_usage.c">
+{`struct cpu_sample {
+    unsigned long long user, nice, system, idle;
+    unsigned long long iowait, irq, softirq, steal;
+};
+
+static int read_cpu(struct cpu_sample *s) {
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return -1;
+    fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+           &s->user, &s->nice, &s->system, &s->idle,
+           &s->iowait, &s->irq, &s->softirq, &s->steal);
+    fclose(f);
+    return 0;
+}
+
+static double calc_cpu_usage(struct cpu_sample *prev,
+                             struct cpu_sample *cur) {
+    unsigned long long prev_idle = prev->idle + prev->iowait;
+    unsigned long long cur_idle  = cur->idle  + cur->iowait;
+    unsigned long long prev_total =
+        prev->user + prev->nice + prev->system +
+        prev->idle + prev->iowait + prev->irq +
+        prev->softirq + prev->steal;
+    unsigned long long cur_total =
+        cur->user + cur->nice + cur->system +
+        cur->idle + cur->iowait + cur->irq +
+        cur->softirq + cur->steal;
+    unsigned long long total_d = cur_total - prev_total;
+    unsigned long long idle_d  = cur_idle  - prev_idle;
+    if (total_d == 0) return 0.0;
+    return 100.0 * (1.0 - (double)idle_d / (double)total_d);
+}`}
+</CodeBlock>
+
+  </Step>
+  <Step title="두 링 초기화">
+
+Adaptive 전환의 핵심은 interrupt 모드 링과 SQPOLL 모드 링을 프로그램 시작 시 동시에 만들어두는 것이다. 모드를 바꿀 때 링을 파괴하고 재생성하면 비용이 크므로, 활성 링 포인터만 교체하는 방식을 사용한다.
+
+<CodeBlock language="c" filename="init_two_rings.c">
+{`/* interrupt mode ring */
+struct io_uring ring_int;
+if (io_uring_queue_init(QD, &ring_int, 0) < 0) {
+    perror("io_uring_queue_init (interrupt)");
+    return 1;
+}
+
+/* polling mode ring (SQPOLL) */
+struct io_uring ring_poll;
+struct io_uring_params p = {0};
+p.flags = IORING_SETUP_SQPOLL;
+p.sq_thread_idle = 2000;
+if (io_uring_queue_init_params(QD, &ring_poll, &p) < 0) {
+    perror("io_uring_queue_init_params (polling)");
+    io_uring_queue_exit(&ring_int);
+    return 1;
+}
+
+enum io_mode { MODE_INTERRUPT, MODE_POLLING };
+enum io_mode current = MODE_INTERRUPT;
+struct io_uring *active = &ring_int;`}
+</CodeBlock>
+
+  </Step>
+  <Step title="전체 코드 작성">
+
+앞서 작성한 CPU 읽기 함수와 두 링 초기화를 조합하여 전체 벤치마크 프로그램을 완성한다.
+
+<CodeBlock language="c" filename="bench_adaptive.c">
+{`#include <liburing.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define QD       32
+#define BS       4096
+#define CPU_THR  70.0
+#define QD_THR   8
+#define COOLDOWN_MS 500
+
+struct cpu_sample {
+    unsigned long long user, nice, system, idle;
+    unsigned long long iowait, irq, softirq, steal;
+};
+
+static int read_cpu(struct cpu_sample *s) {
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return -1;
+    fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+           &s->user, &s->nice, &s->system, &s->idle,
+           &s->iowait, &s->irq, &s->softirq, &s->steal);
+    fclose(f);
+    return 0;
+}
+
+static double calc_cpu_usage(struct cpu_sample *prev,
+                             struct cpu_sample *cur) {
+    unsigned long long prev_idle = prev->idle + prev->iowait;
+    unsigned long long cur_idle  = cur->idle  + cur->iowait;
+    unsigned long long prev_total =
+        prev->user + prev->nice + prev->system +
+        prev->idle + prev->iowait + prev->irq +
+        prev->softirq + prev->steal;
+    unsigned long long cur_total =
+        cur->user + cur->nice + cur->system +
+        cur->idle + cur->iowait + cur->irq +
+        cur->softirq + cur->steal;
+    unsigned long long total_d = cur_total - prev_total;
+    unsigned long long idle_d  = cur_idle  - prev_idle;
+    if (total_d == 0) return 0.0;
+    return 100.0 * (1.0 - (double)idle_d / (double)total_d);
+}
+
+enum io_mode { MODE_INTERRUPT, MODE_POLLING };
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <file>\n", argv[0]);
+        return 1;
+    }
+
+    int fd = open(argv[1], O_RDONLY | O_DIRECT);
+    if (fd < 0) { perror("open"); return 1; }
+
+    /* Initialize two rings: interrupt and polling */
+    struct io_uring ring_int, ring_poll;
+    if (io_uring_queue_init(QD, &ring_int, 0) < 0) {
+        perror("io_uring_queue_init (interrupt)");
+        return 1;
+    }
+
+    struct io_uring_params p = {0};
+    p.flags = IORING_SETUP_SQPOLL;
+    p.sq_thread_idle = 2000;
+    if (io_uring_queue_init_params(QD, &ring_poll, &p) < 0) {
+        perror("io_uring_queue_init_params (polling)");
+        io_uring_queue_exit(&ring_int);
+        return 1;
+    }
+
+    enum io_mode current = MODE_INTERRUPT;
+    struct io_uring *active = &ring_int;
+
+    struct cpu_sample prev_cpu, cur_cpu;
+    read_cpu(&prev_cpu);
+
+    struct timespec last_switch;
+    clock_gettime(CLOCK_MONOTONIC, &last_switch);
+
+    void *buf;
+    posix_memalign(&buf, BS, BS);
+
+    int inflight = 0;
+
+    for (int i = 0; i < 10000; i++) {
+        /* Submit a read request */
+        struct io_uring_sqe *sqe = io_uring_get_sqe(active);
+        if (!sqe) {
+            struct io_uring_cqe *cqe;
+            io_uring_wait_cqe(active, &cqe);
+            io_uring_cqe_seen(active, cqe);
+            inflight--;
+            sqe = io_uring_get_sqe(active);
+        }
+        io_uring_prep_read(sqe, fd, buf, BS, 0);
+        io_uring_submit(active);
+        inflight++;
+
+        /* Reap completions */
+        struct io_uring_cqe *cqe;
+        while (io_uring_peek_cqe(active, &cqe) == 0) {
+            io_uring_cqe_seen(active, cqe);
+            inflight--;
+        }
+
+        /* Policy decision every 200 iterations */
+        if (i % 200 == 0 && i > 0) {
+            read_cpu(&cur_cpu);
+            double cpu = calc_cpu_usage(&prev_cpu, &cur_cpu);
+            prev_cpu = cur_cpu;
+
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms =
+                (now.tv_sec - last_switch.tv_sec) * 1000 +
+                (now.tv_nsec - last_switch.tv_nsec) / 1000000;
+
+            if (elapsed_ms >= COOLDOWN_MS) {
+                if (cpu > CPU_THR &&
+                    current == MODE_POLLING) {
+                    current = MODE_INTERRUPT;
+                    active = &ring_int;
+                    last_switch = now;
+                    printf("[switch] -> INTERRUPT "
+                           "(cpu=%.1f%%)\n", cpu);
+                } else if (inflight >= QD_THR &&
+                           cpu <= CPU_THR &&
+                           current == MODE_INTERRUPT) {
+                    current = MODE_POLLING;
+                    active = &ring_poll;
+                    last_switch = now;
+                    printf("[switch] -> POLLING "
+                           "(cpu=%.1f%%, qd=%d)\n",
+                           cpu, inflight);
+                }
+            }
+        }
+    }
+
+    printf("Done. Final mode: %s\n",
+           current == MODE_POLLING
+               ? "POLLING" : "INTERRUPT");
+
+    io_uring_queue_exit(&ring_int);
+    io_uring_queue_exit(&ring_poll);
+    free(buf);
+    close(fd);
+    return 0;
+}`}
+</CodeBlock>
+
+<Callout kind="note">
+`io_uring_submit()`은 interrupt 모드 링에서는 `io_uring_enter` 시스템 콜을 발생시키지만, SQPOLL 링에서는 커널 스레드가 슬립 중일 때만 깨우는 역할을 한다. 따라서 두 링 모두에 동일한 호출을 사용해도 동작이 올바르다.
+</Callout>
+
+  </Step>
+  <Step title="빌드 및 실행">
+
+테스트 파일은 `O_DIRECT`로 읽기 위해 4KB 정렬된 충분한 크기가 필요하다.
+
+<Terminal title="빌드 및 실행" commands={[
+  { cmd: "gcc -O2 -o bench_adaptive bench_adaptive.c -luring" },
+  { cmd: "dd if=/dev/zero of=testfile bs=1M count=256 oflag=direct", output: ["256+0 records in", "256+0 records out"] },
+  { cmd: "sudo ./bench_adaptive testfile", output: ["[switch] -> POLLING (cpu=12.3%, qd=24)", "Done. Final mode: POLLING"] }
+]} />
+
+<Callout kind="warn">
+SQPOLL 모드는 `CAP_SYS_NICE` 권한이 필요하다. 권한 오류가 발생하면 `sudo`로 실행하거나, 커널 5.12 이상에서 `IORING_SETUP_SQPOLL`의 unprivileged 지원을 확인한다.
+</Callout>
+
+  </Step>
+</Steps>
+
+## fio baseline과 비교하기
+
+<Callout kind="warn">
+이 비교에는 구조적 한계가 있다. adaptive 결과는 직접 짠 C 벤치마크로, interrupt와 SQPOLL 결과는 fio로 측정했다. 측정 harness가 다르므로 절대값의 직접 비교는 부정확하다. 동일 디바이스(NVMe), 동일 블록 크기(4KB), 동일 런타임을 맞추어 최대한 공정하게 비교했지만, harness 차이에서 오는 오차를 감안해야 한다.
+</Callout>
+
+fio로 interrupt와 SQPOLL 기준선을 먼저 측정하고, 이어서 adaptive C 벤치마크를 실행한다.
+
+<Terminal title="fio baseline 측정" commands={[
+  { cmd: "fio --name=int-qd16 --ioengine=io_uring --rw=randread --bs=4k --direct=1 --iodepth=16 --filename=/dev/nvme0n1 --runtime=30 --time_based --output-format=json --output=int-qd16.json" },
+  { cmd: "fio --name=sqpoll-qd16 --ioengine=io_uring --sqthread_poll=1 --rw=randread --bs=4k --direct=1 --iodepth=16 --filename=/dev/nvme0n1 --runtime=30 --time_based --output-format=json --output=sqpoll-qd16.json" }
+]} />
+
+<Terminal title="adaptive C 벤치마크 실행" commands={[
+  { cmd: "sudo ./bench_adaptive /dev/nvme0n1", output: ["[switch] -> POLLING (cpu=8.1%, qd=28)", "Done. Final mode: POLLING"] }
+]} />
+
+다음 그래프는 QD에 따른 세 모드의 평균 지연을 비교한 것이다. fio interrupt와 fio SQPOLL은 fio JSON 출력에서, adaptive C는 직접 구현한 벤치마크에서 추출한 값이다.
+
+<Chart
+  kind="line"
+  data={adaptiveQdLatency}
+  xKey="qd"
+  series={[
+    { key: 'fioInterrupt', label: 'fio Interrupt', color: 'interrupt' },
+    { key: 'fioSqpoll',    label: 'fio SQPOLL',    color: 'polling' },
+    { key: 'adaptiveC',    label: 'Adaptive C',    color: 'adaptive' },
+  ]}
+  xLabel="Queue Depth"
+  yLabel="Latency (us)"
+  caption="QD별 평균 지연 비교: fio Interrupt / fio SQPOLL / Adaptive C (4KB randread, NVMe, 예시 데이터)"
+/>
+
+Adaptive C는 전 구간에서 fio SQPOLL과 유사한 지연을 보인다. QD=16 기준으로 fio SQPOLL이 70us, adaptive C가 73us를 기록하였고, fio interrupt의 118us와는 큰 차이가 있다. adaptive가 idle 상태에서 polling 모드를 선택하기 때문에 이 결과는 예상과 부합한다.
+
+<Chart
+  kind="bar"
+  data={adaptiveComparison}
+  xKey="cpuLoad"
+  series={[
+    { key: 'fioInterrupt', label: 'fio Interrupt', color: 'interrupt' },
+    { key: 'fioSqpoll',    label: 'fio SQPOLL',    color: 'polling' },
+    { key: 'adaptiveC',    label: 'Adaptive C',    color: 'adaptive' },
+  ]}
+  xLabel="CPU Background Load"
+  yLabel="Throughput (MB/s)"
+  caption="CPU 부하 단계별 처리량 비교: fio Interrupt / fio SQPOLL / Adaptive C (QD=16, 4KB randread, 예시 데이터)"
+/>
+
+Idle 상태에서 adaptive C는 560MB/s로 fio SQPOLL의 580MB/s에 근접한다. CPU 100% 부하에서는 fio SQPOLL이 340MB/s로 급락하지만, adaptive C는 405MB/s를 유지하여 fio interrupt의 380MB/s보다도 높다. adaptive가 부하를 감지하고 interrupt로 전환하되, QD가 높아 폴링이 유리한 순간에는 다시 polling으로 복귀하기 때문이다.
+
+<Callout kind="checkpoint">
+Adaptive C가 idle에서 fio SQPOLL에 근접하고(560 vs 580 MB/s), CPU 100%에서 fio interrupt보다 높은 처리량을 보인다면(405 vs 380 MB/s) 정책이 동작하는 것이다.
+</Callout>
+
+두 그래프의 라인/바 사이 보간은 실제 측정 사이의 동작을 의미하지 않는다. 각 데이터 포인트는 해당 조건에서의 개별 측정값이다.
+
+</Section>

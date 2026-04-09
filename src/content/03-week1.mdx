@@ -1,0 +1,275 @@
+import { round1Results } from '../data/experiments';
+
+<Section title="실습: io_uring으로 파일 읽기" id="week1">
+
+## 이번 실습의 목표
+
+이번 실습의 목표는 벤치마크 수치가 아니다.
+io_uring의 SQ/CQ 흐름을 직접 C로 짜서, "내가 io_uring으로 파일을 읽었다"는 경험을 얻는 것이다.
+`clock_gettime`으로 대강의 latency만 확인하면 충분하다.
+
+## 사전 준비
+
+<Steps>
+  <Step title="커널 버전 확인">
+
+io_uring은 리눅스 5.1부터 지원된다.
+커널 버전과 NVMe 디바이스 유무를 먼저 확인한다.
+
+<Terminal title="환경 확인" commands={[
+  { cmd: "uname -r", output: ["6.1.0-25-generic"] },
+  { cmd: "lsblk -d -o NAME,ROTA,TRAN | grep nvme", output: ["nvme0n1  0  nvme"] }
+]} />
+
+`ROTA`가 0이면 비회전(SSD) 디바이스다.
+NVMe가 없으면 SATA SSD로도 실습할 수 있지만, 지연 수치가 200~500us 범위로 높아진다.
+
+  </Step>
+  <Step title="liburing 설치">
+
+배포판 패키지로 설치하거나 소스에서 빌드한다.
+
+<Terminal title="liburing 설치" commands={[
+  { cmd: "sudo apt install liburing-dev", output: ["Reading package lists...", "Setting up liburing-dev (2.3-1) ..."] }
+]} />
+
+패키지가 없는 환경이라면 소스 빌드를 사용한다.
+
+<Terminal title="소스 빌드" commands={[
+  { cmd: "git clone https://github.com/axboe/liburing.git && cd liburing && ./configure && make -j$(nproc) && sudo make install" }
+]} />
+
+  </Step>
+  <Step title="테스트 파일 생성">
+
+1GB 크기의 랜덤 데이터를 준비한다.
+파일이 작으면 읽기 오프셋이 페이지 캐시에 집중되어 측정이 왜곡된다.
+
+<Terminal title="테스트 파일 생성" commands={[
+  { cmd: "dd if=/dev/urandom of=/tmp/testfile bs=1M count=1024", output: ["1024+0 records in", "1024+0 records out", "1073741824 bytes (1.1 GB) copied, 5.23 s, 205 MB/s"] }
+]} />
+
+  </Step>
+</Steps>
+
+## io_uring 흐름 직접 구현하기
+
+앞 절에서 배운 io_uring의 다섯 단계를 실제 C 코드로 옮긴다.
+각 단계가 어떤 의미인지 하나씩 짚으며 읽어 보자.
+
+1. `io_uring_get_sqe()` -- SQ에서 빈 슬롯을 하나 받는다. 요청서 양식을 하나 꺼내는 것이다.
+2. `io_uring_prep_read()` -- "이 파일의 이 위치에서 4KB를 읽어라"라고 양식을 채운다.
+3. `io_uring_submit()` -- 채워 둔 SQE를 커널에 제출한다. 시스템 콜은 이 한 번뿐이다.
+4. `io_uring_wait_cqe()` -- CQ에 결과가 도착할 때까지 기다린다. 커널이 읽기를 완료하면 CQE를 남긴다.
+5. `io_uring_cqe_seen()` -- 결과를 확인했음을 커널에 알린다. 이래야 해당 CQ 슬롯이 재사용된다.
+
+아래 코드는 이 다섯 단계를 100번 반복하여 4KB 랜덤 읽기의 평균 지연을 출력한다.
+QD 튜닝이나 배칭 최적화 없이, 한 번에 하나씩 요청하는 가장 단순한 구조다.
+
+<CodeBlock language="c" filename="uring_read.c">
+{`#include <liburing.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define BS    4096
+#define COUNT 100
+
+static double timespec_diff_us(struct timespec *a,
+                               struct timespec *b)
+{
+    return (b->tv_sec - a->tv_sec) * 1e6
+         + (b->tv_nsec - a->tv_nsec) / 1e3;
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2) {
+        fprintf(stderr,
+                "usage: %s <file>\\n", argv[0]);
+        return 1;
+    }
+
+    int fd = open(argv[1], O_RDONLY | O_DIRECT);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+
+    struct io_uring ring;
+    if (io_uring_queue_init(1, &ring, 0) < 0) {
+        perror("io_uring_queue_init");
+        close(fd);
+        return 1;
+    }
+
+    /* O_DIRECT requires aligned buffer */
+    void *buf;
+    if (posix_memalign(&buf, BS, BS) != 0) {
+        perror("posix_memalign");
+        return 1;
+    }
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    for (int i = 0; i < COUNT; i++) {
+        off_t off = (rand() % 8192) * (off_t)BS;
+
+        /* step 1: get empty SQE slot */
+        struct io_uring_sqe *sqe;
+        sqe = io_uring_get_sqe(&ring);
+
+        /* step 2: fill in the read request */
+        io_uring_prep_read(sqe, fd, buf, BS, off);
+
+        /* step 3: submit to kernel */
+        io_uring_submit(&ring);
+
+        /* step 4: wait for completion */
+        struct io_uring_cqe *cqe;
+        if (io_uring_wait_cqe(&ring, &cqe) < 0) {
+            perror("io_uring_wait_cqe");
+            break;
+        }
+        if (cqe->res < 0) {
+            fprintf(stderr, "read error: %s\\n",
+                    strerror(-cqe->res));
+            break;
+        }
+
+        /* step 5: mark CQE as consumed */
+        io_uring_cqe_seen(&ring, cqe);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double total_us = timespec_diff_us(&t0, &t1);
+    printf("count=%d, total=%.1f us, "
+           "avg=%.1f us/op\\n",
+           COUNT, total_us, total_us / COUNT);
+
+    free(buf);
+    io_uring_queue_exit(&ring);
+    close(fd);
+    return 0;
+}`}
+</CodeBlock>
+
+## 빌드하고 실행하기
+
+코드를 저장한 뒤 빌드하고 실행한다.
+
+<Terminal title="빌드 및 실행" commands={[
+  { cmd: "gcc -O2 -o uring_read uring_read.c -luring" },
+  { cmd: "./uring_read /tmp/testfile", output: ["count=100, total=9200.0 us, avg=92.0 us/op"] }
+]} />
+
+<Callout kind="checkpoint">
+프로그램이 에러 없이 실행되고, 대략 80~120us 범위의 숫자가 출력되면 성공이다.
+정확한 수치는 중요하지 않다. io_uring으로 파일을 읽었다는 사실이 중요하다.
+</Callout>
+
+## POSIX read()와 비교해 보기
+
+같은 작업을 전통적인 `read()` 시스템 콜로도 해 보면 차이를 체감할 수 있다.
+아래는 동일한 조건(4KB 랜덤 읽기 100회, `O_DIRECT`)으로 `read()`를 호출하는 코드다.
+
+<CodeBlock language="c" filename="posix_read.c">
+{`#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+
+#define BS    4096
+#define COUNT 100
+
+static double timespec_diff_us(struct timespec *a,
+                               struct timespec *b)
+{
+    return (b->tv_sec - a->tv_sec) * 1e6
+         + (b->tv_nsec - a->tv_nsec) / 1e3;
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2) {
+        fprintf(stderr,
+                "usage: %s <file>\\n", argv[0]);
+        return 1;
+    }
+
+    int fd = open(argv[1], O_RDONLY | O_DIRECT);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+
+    void *buf;
+    if (posix_memalign(&buf, BS, BS) != 0) {
+        perror("posix_memalign");
+        return 1;
+    }
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    for (int i = 0; i < COUNT; i++) {
+        off_t off = (rand() % 8192) * (off_t)BS;
+        pread(fd, buf, BS, off);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double total_us = timespec_diff_us(&t0, &t1);
+    printf("count=%d, total=%.1f us, "
+           "avg=%.1f us/op\\n",
+           COUNT, total_us, total_us / COUNT);
+
+    free(buf);
+    close(fd);
+    return 0;
+}`}
+</CodeBlock>
+
+<Terminal title="POSIX read 빌드 및 실행" commands={[
+  { cmd: "gcc -O2 -o posix_read posix_read.c" },
+  { cmd: "./posix_read /tmp/testfile", output: ["count=100, total=11000.0 us, avg=110.0 us/op"] }
+]} />
+
+두 결과를 나란히 놓으면 다음과 같다.
+
+<Chart
+  kind="bar"
+  data={round1Results}
+  xKey="label"
+  series={[
+    { key: 'latency', label: 'Avg Latency (us)', color: 'interrupt' },
+  ]}
+  xLabel=""
+  yLabel="Latency (us)"
+  caption="POSIX read()와 io_uring interrupt 모드의 평균 지연 비교 (예시 데이터, 문헌상 일반적인 범위)"
+/>
+
+QD=1 수준에서는 차이가 극적이지 않다.
+io_uring이 약 92us, POSIX `read()`가 약 110us로 16% 정도의 개선이다.
+한 번에 하나씩 요청하는 패턴에서는 배칭의 이점이 크게 드러나지 않기 때문이다.
+
+<Callout kind="tip">
+정밀한 비교는 2회차에서 fio로 한다. 여기서는 "io_uring이 뭔가 다르구나" 정도만 느끼면 된다.
+QD를 높이면 배칭 효과가 커지면서 격차가 벌어지는데, 이것은 다음 실습에서 직접 확인한다.
+</Callout>
+
+## 여기까지 이해한 것
+
+이번 실습에서 직접 확인한 것은 세 가지다.
+첫째, io_uring의 SQ/CQ 흐름을 C 코드로 구현하고 실제로 파일을 읽었다.
+둘째, `get_sqe`, `prep_read`, `submit`, `wait_cqe`, `cqe_seen` 다섯 단계가 io_uring의 기본 사이클이라는 것을 코드로 확인했다.
+셋째, 같은 조건에서 POSIX `read()`보다 io_uring이 약간 빠르다는 것을 대략적으로 관찰했다.
+
+아직 QD를 1로 고정했기 때문에 io_uring의 진짜 강점인 배칭과 비동기 처리는 활용하지 못했다.
+다음 회차에서는 fio를 사용하여 QD, SQPOLL, CPU 부하를 변수로 두고 정밀하게 측정한다.
+
+</Section>

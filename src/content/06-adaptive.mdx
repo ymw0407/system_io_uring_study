@@ -1,0 +1,80 @@
+<Section title="Adaptive 정책 상세 설계" id="adaptive-strategy">
+
+이 절에서는 앞서 구현한 adaptive 정책의 설계 근거를 단계별로 분석한다. 왜 이 신호들을 선택했는지, 임계값은 어디에서 왔는지, 그리고 이 접근의 구조적 한계는 무엇인지를 정리한다.
+
+<Steps>
+  <Step title="신호 선택: CPU 사용률과 QD">
+
+SQPOLL 모드의 핵심 비용은 CPU 점유에 있다. 커널 스레드가 SQ를 쉬지 않고 폴링하므로 CPU 코어 하나를 거의 100% 소모한다. 시스템에 여유 CPU가 있을 때는 이 비용이 문제 되지 않지만, 다른 작업이 CPU를 많이 사용하면 폴링 스레드가 유용한 연산과 경쟁하게 된다. 따라서 CPU 사용률은 polling의 비용 측면을 대표하는 신호다.
+
+Queue Depth는 polling의 이점 측면을 대표한다. QD가 낮으면 인터럽트 오버헤드의 절대량이 작아 모드 전환의 이점이 미미하지만, QD가 높으면 인터럽트 누적 비용이 커져 폴링의 지연 절감 효과가 두드러진다. 두 신호를 조합하면 비용과 이점을 동시에 판단할 수 있다.
+
+  </Step>
+  <Step title="임계값 선정: CPU 70%, QD 8">
+
+CPU 임계값 70%는 경험적 관찰에 기반한다. SQPOLL 커널 스레드는 단독으로 CPU의 약 25~30%를 소비하는데, 시스템 부하가 70%를 넘는 시점부터 SQPOLL 스레드가 다른 작업의 스케줄링 지연을 유발하는 것이 관측된다. 이 지점을 넘으면 폴링의 지연 절감 효과보다 스케줄링 경쟁으로 인한 성능 저하가 더 커진다.
+
+QD 임계값 8은 NVMe 장치의 특성에서 비롯된다. QD가 8 미만일 때 polling과 interrupt의 지연 차이는 10~20 마이크로초 수준이지만, QD가 8 이상이 되면 인터럽트 처리의 누적 비용이 눈에 띄게 증가한다. 두 임계값 모두 워크로드와 하드웨어에 따라 달라질 수 있으므로, 실제 배포 시에는 튜닝 대상이다.
+
+  </Step>
+  <Step title="히스테리시스 (500ms 쿨다운)">
+
+모드 전환은 무비용이 아니다. 활성 링을 교체할 때 이전 링에 남아 있는 in-flight 요청 처리 과정에서 수백 마이크로초의 지연이 발생할 수 있다. CPU 사용률이 임계값 근처에서 진동하면 매 샘플링마다 모드가 바뀌어 오히려 성능이 하락한다.
+
+500밀리초 쿨다운은 샘플링 주기(200밀리초)의 약 2.5배로 설정하여, 최소 두 번의 샘플링을 거친 뒤에야 다시 전환을 고려하도록 한 것이다.
+
+  </Step>
+  <Step title="두 링 접근법">
+
+구현에서는 interrupt 모드 링과 SQPOLL 모드 링을 프로그램 시작 시 동시에 초기화하고, 활성 링 포인터만 교체한다. 링을 매번 파괴하고 재생성하는 비용을 피할 수 있다는 것이 장점이다.
+
+단점은 SQPOLL 링이 비활성 상태에서도 커널 스레드가 `sq_thread_idle` 시간 동안 살아 있다는 점이다. 이 프로젝트에서는 `sq_thread_idle`을 2000밀리초로 설정하여, 비활성 링의 폴링 스레드가 2초 후 자동으로 슬립 상태에 들어가도록 했다. 새 요청을 제출하면 슬립 중인 스레드가 다시 깨어난다.
+
+  </Step>
+</Steps>
+
+## 전체 정책 흐름
+
+아래 의사 코드는 초기화부터 모드 전환까지의 전체 흐름을 정리한 것이다.
+
+<CodeBlock language="plaintext" filename="adaptive_full_policy.txt">
+{`INIT:
+    ring_int   = io_uring_queue_init(QD, 0)
+    ring_poll  = io_uring_queue_init_params(QD, SQPOLL)
+    active     = ring_int
+    mode       = INTERRUPT
+    last_switch_time = now()
+
+LOOP (every 200ms sampling):
+    cpu = sample_cpu_from_proc_stat()
+    qd  = count_inflight(active)
+
+    if now() - last_switch_time < 500ms:
+        continue    // cooldown not expired
+
+    if mode == POLLING and cpu > 70%:
+        drain_inflight(ring_poll)
+        active = ring_int
+        mode   = INTERRUPT
+        last_switch_time = now()
+
+    else if mode == INTERRUPT and qd >= 8 and cpu <= 70%:
+        active = ring_poll
+        mode   = POLLING
+        last_switch_time = now()
+
+SUBMIT:
+    sqe = io_uring_get_sqe(active)
+    io_uring_prep_read(sqe, fd, buf, BS, offset)
+    io_uring_submit(active)`}
+</CodeBlock>
+
+<Callout kind="warn">
+이 구현은 사용자 공간에서 `/proc/stat`을 주기적으로 읽는 방식이므로, 약 100~200밀리초의 샘플링 지연이 불가피하다. 마이크로초 단위의 급격한 부하 변동에는 대응할 수 없으며, IOPOLL(장치 수준 완료 폴링)은 이 접근의 범위 밖이다.
+</Callout>
+
+## DPAS와의 비교
+
+커널 수준의 DPAS는 인터럽트 핸들러 내부에서 직접 모드를 전환할 수 있어 반응 지연이 수 마이크로초에 불과하다. 반면 이 프로젝트의 사용자 공간 접근은 커널을 수정하지 않아도 되므로 배포가 간단하고, 애플리케이션 수준에서 워크로드 특성을 직접 반영할 수 있다. 두 접근은 반응 정밀도와 배포 용이성 사이의 트레이드오프이며, 워크로드의 변동 주기에 따라 필요한 정밀도 수준이 달라진다.
+
+</Section>
