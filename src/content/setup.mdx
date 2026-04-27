@@ -1,0 +1,79 @@
+<Section title="실습 환경 설정" id="setup">
+
+이 절은 Part 2 이후의 실습 환경을 준비하는 방법을 다룬다.
+모든 회차는 **QEMU 가상 머신** 안의 Ubuntu에서 진행한다.
+Ubuntu 공식 페이지에서 22.04 LTS Server ISO를 받아 QEMU로 설치한 뒤, 게스트 안에서 `liburing-dev`만 설치하면 끝난다.
+
+## 공통 요구사항
+
+| 항목 | 요건 |
+|---|---|
+| 호스트 OS | macOS, Linux, Windows 중 하나 |
+| QEMU | 7.0 이상 (KVM/HVF/WHPX 가속 지원) |
+| RAM | 호스트 8GB 이상 (VM에 4GB 할당) |
+| 디스크 | 60GB 이상 여유 |
+| 게스트 OS | **Ubuntu 22.04 LTS Server** ([releases.ubuntu.com/22.04](https://releases.ubuntu.com/22.04/)에서 ISO 다운로드) |
+| 게스트 커널 | Ubuntu 22.04의 기본 5.15 HWE 커널 사용 (io_uring은 5.1+에서 동작하므로 추가 업그레이드 불필요) |
+| 인터넷 | ISO 다운로드 및 게스트 패키지 설치 시 필요 |
+
+게스트 OS는 Ubuntu Server를 권장한다.
+Desktop 변종은 GUI 무게 때문에 부팅이 느리고 자원을 더 먹는다.
+ISO 한 번 받아두면 OS별 차이는 QEMU 설치 방법과 가속 플래그 한 줄뿐이다.
+
+<Callout kind="note">
+이 페이지는 [dpas-lab의 setup 가이드](https://dpas-lab.pages.dev/setup)를 본 실습에 맞게 단순화한 버전이다.
+DPAS 자체는 다루지 않으므로 dpas-lab의 "메인라인 5.18 커널 업그레이드"와 "DPAS 패치 적용" 단계는 건너뛰며, Ubuntu 22.04의 기본 5.15 HWE 커널과 apt 패키지의 liburing으로 충분하다.
+NVMe `poll_queues` 모듈 옵션 같은 polling 세부 설정이 필요하면 Part 3의 IOPOLL 실험 섹션에서 별도로 다룬다.
+</Callout>
+
+## 호스트 OS 선택
+
+자기 호스트 OS를 골라 셋업 가이드로 들어간다.
+세 경로 모두 동일한 Ubuntu ISO를 같은 방식으로 설치하며, 차이는 **QEMU 설치 방법과 가속 플래그 한 줄**뿐이다.
+
+<StepSection title="OS별 셋업 가이드" id="os-selection">
+  <StepCard
+    step={1}
+    kind="setup"
+    label="HOST: macOS"
+    title="QEMU + HVF 가속"
+    description="Apple Silicon, Intel Mac 모두 Homebrew로 QEMU 설치. Hypervisor.framework로 하드웨어 가속을 받는다."
+    tools={['brew', 'qemu-system-x86_64', '-accel hvf']}
+    href="/setup-mac"
+  />
+
+  <StepCard
+    step={2}
+    kind="lab"
+    label="HOST: Linux"
+    title="QEMU + KVM 가속"
+    description="배포판 패키지로 QEMU 설치. KVM은 보통 커널에 이미 포함돼 있어 추가 설정이 거의 없다."
+    tools={['apt/dnf/pacman', 'qemu-system-x86', '/dev/kvm']}
+    href="/setup-linux"
+  />
+
+  <StepCard
+    step={3}
+    kind="default"
+    label="HOST: Windows"
+    title="WSL2 또는 네이티브 QEMU"
+    description="WSL2 안에서 KVM 가속을 받는 경로(추천), 또는 Windows 네이티브 QEMU에 WHPX 가속을 쓰는 경로 둘 중 선택."
+    tools={['wsl --install', 'qemu', '-accel whpx']}
+    href="/setup-windows"
+    isLast
+  />
+</StepSection>
+
+## 이후 흐름
+
+각 OS 가이드는 다음 일곱 단계로 구성돼 있다.
+
+1. QEMU 설치 (호스트 OS별)
+2. Ubuntu 22.04 LTS Server ISO 다운로드
+3. 디스크 이미지 생성 (OS용 qcow2 + 실험용 NVMe raw)
+4. ISO로 부팅해서 Ubuntu 설치 (한 번만)
+5. 설치된 VM 부팅 → SSH 접속
+6. 게스트 안에서 `liburing-dev` 설치
+7. 환경 검증과 준비 완료 체크리스트
+
+</Section>

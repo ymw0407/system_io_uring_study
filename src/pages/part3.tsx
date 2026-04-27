@@ -5,13 +5,13 @@ import Week2 from '../content/04-week2.mdx';
 
 const MdxWeek2 = Week2 as MdxComponent;
 
-export default function Round2() {
+export default function Part3() {
   return (
     <>
       <MdxWeek2 components={mdxComponents} />
       <PageNav
-        prev={{ to: '/round1', label: 'Round 1: Baseline + Interrupt' }}
-        next={{ to: '/round3', label: 'Round 3: Adaptive' }}
+        prev={{ to: '/part2', label: 'Part 2: C로 직접 구현' }}
+        next={{ to: '/part4', label: 'Part 4: Adaptive 구현' }}
       />
     </>
   );

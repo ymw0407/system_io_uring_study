@@ -1,0 +1,225 @@
+<Section title="Windows 셋업 — WSL2 또는 WHPX" id="setup-windows">
+
+이 페이지는 호스트가 **Windows**일 때 실습 환경을 처음부터 만드는 방법을 다룬다.
+다른 OS는 [Setup 인덱스](/setup)로 돌아가서 선택한다.
+
+Windows에서는 두 가지 경로가 있다.
+
+- **경로 A: WSL2 + QEMU (추천)** — Linux 위에서 QEMU를 돌리는 셈이라 KVM 가속을 받을 수 있고, 명령이 [Linux 셋업](/setup-linux)과 거의 동일해진다.
+- **경로 B: Windows 네이티브 QEMU + WHPX 가속** — Windows에 QEMU를 직접 설치하고 Windows Hypervisor Platform으로 가속한다.
+
+## 경로 A: WSL2 + QEMU (추천)
+
+### A.1 WSL2 설치
+
+PowerShell을 **관리자 권한**으로 열고 실행한다.
+
+<Terminal title="WSL2 설치 (PowerShell 관리자)" commands={[
+  { cmd: "wsl --install" }
+]} />
+
+재부팅 후 자동으로 Ubuntu 셋업이 시작된다.
+사용자명·비밀번호를 만든 뒤 Ubuntu 셸에 진입한다.
+
+### A.2 이후 절차
+
+이 시점부터는 [Linux 셋업 가이드](/setup-linux)의 1번(QEMU 설치) 단계부터 그대로 따른다.
+ISO 다운로드, `qemu-img`로 디스크 생성, ISO로 부팅해 Ubuntu 설치, SSH 접속, liburing 설치, 검증까지 모든 명령이 동일하다.
+KVM도 WSL2 안에서 활성화되어 있어 `-enable-kvm` 가속을 그대로 쓸 수 있다.
+
+<Callout kind="note">
+WSL2의 가상 디스크는 Part 2 코드 실행에는 충분하지만, Part 3의 정밀 NVMe 측정에는 한계가 있다.
+호스트 NVMe를 직접 마운트하려면 `wsl --mount` 옵션이 필요하고 권한 설정이 까다로우므로, 정밀 측정은 학과 Linux 서버에서 하는 편이 낫다.
+</Callout>
+
+## 경로 B: Windows 네이티브 QEMU + WHPX
+
+### B.1 Windows Hypervisor Platform 활성화
+
+"제어판 → 프로그램 → Windows 기능 켜기/끄기"에서 **"Windows Hypervisor Platform"** 을 체크한다.
+재부팅이 필요할 수 있다.
+
+### B.2 QEMU 설치
+
+세 가지 중 하나를 선택한다.
+
+**Scoop**
+
+<Terminal title="Scoop으로 QEMU 설치" commands={[
+  { cmd: "scoop install qemu" }
+]} />
+
+**Chocolatey**
+
+<Terminal title="Chocolatey로 QEMU 설치" commands={[
+  { cmd: "choco install qemu" }
+]} />
+
+**공식 인스톨러** — [https://qemu.weilnetz.de/w64/](https://qemu.weilnetz.de/w64/) 에서 받아 설치.
+
+설치 후 PowerShell 또는 CMD에서 버전을 확인한다.
+
+<Terminal title="QEMU 버전" commands={[
+  { cmd: "qemu-system-x86_64.exe --version", output: ["QEMU emulator version 8.2.0"] }
+]} />
+
+### B.3 Ubuntu ISO 다운로드
+
+[releases.ubuntu.com/22.04](https://releases.ubuntu.com/22.04/)에서 **Ubuntu 22.04 LTS Server**의 ISO를 받는다.
+파일명은 보통 `ubuntu-22.04.x-live-server-amd64.iso`다.
+받은 파일을 실습 폴더(예: `C:\io-uring-lab`)에 두고, 다음 단계의 명령은 모두 그 폴더에서 실행한다.
+
+### B.4 디스크 이미지 생성
+
+OS용 디스크와 실험용 가상 NVMe 디스크를 분리해서 만든다.
+
+<Terminal title="디스크 이미지 생성 (PowerShell)" commands={[
+  { cmd: "qemu-img.exe create -f qcow2 ubuntu.qcow2 30G" },
+  { cmd: "qemu-img.exe create -f raw nvme.raw 16G" }
+]} />
+
+### B.5 ISO로 부팅해서 Ubuntu 설치 (최초 1회)
+
+ISO와 빈 디스크 두 개를 함께 부팅한다.
+
+<CodeBlock language="powershell" filename="install-vm-windows.ps1">
+{`qemu-system-x86_64.exe \`
+  -accel whpx \`
+  -m 4G -smp 4 \`
+  -cdrom ubuntu-22.04.5-live-server-amd64.iso \`
+  -drive file=ubuntu.qcow2,format=qcow2,if=virtio \`
+  -drive file=nvme.raw,format=raw,if=none,id=nvme0 \`
+  -device nvme,drive=nvme0,serial=test \`
+  -netdev user,id=net0,hostfwd=tcp::2222-:22 \`
+  -device virtio-net-pci,netdev=net0`}
+</CodeBlock>
+
+PowerShell에서는 줄바꿈이 백틱(`` ` ``), CMD에서는 `^`다.
+한 줄로 붙여 실행해도 된다.
+
+설치 위저드에서 챙길 것:
+
+- 언어·키보드 기본값으로 진행
+- 네트워크: DHCP 자동 (포트 포워딩이 알아서 처리)
+- 디스크: `ubuntu.qcow2` 전체를 LVM으로 사용 (NVMe 디스크는 건드리지 않음)
+- 사용자명·비밀번호 설정
+- **"Install OpenSSH server" 체크 필수** (이후 SSH 접속에 사용)
+
+설치 완료 메시지가 뜨면 VM을 종료한다.
+
+### B.6 설치된 VM 부팅
+
+이후로는 ISO 없이 바로 부팅한다.
+
+<CodeBlock language="powershell" filename="run-vm-windows.ps1">
+{`qemu-system-x86_64.exe \`
+  -accel whpx \`
+  -m 4G -smp 4 \`
+  -drive file=ubuntu.qcow2,format=qcow2,if=virtio \`
+  -drive file=nvme.raw,format=raw,if=none,id=nvme0 \`
+  -device nvme,drive=nvme0,serial=test \`
+  -netdev user,id=net0,hostfwd=tcp::2222-:22 \`
+  -device virtio-net-pci,netdev=net0 \`
+  -nographic`}
+</CodeBlock>
+
+### B.7 SSH 접속
+
+새 PowerShell 창에서 (Windows 10/11에는 `ssh` 클라이언트가 기본 포함):
+
+<Terminal title="SSH 접속" commands={[
+  { cmd: "ssh -p 2222 ubuntu@localhost" }
+]} />
+
+설치 시 만든 사용자명·비밀번호로 접속한다.
+
+## 게스트 안에서 liburing 설치 (두 경로 공통)
+
+이후 명령은 모두 **게스트(VM) 안의 셸에서** 실행한다.
+
+<Terminal title="liburing과 빌드 도구 설치" commands={[
+  { cmd: "sudo apt update" },
+  { cmd: "sudo apt install -y liburing-dev gcc build-essential pkg-config" }
+]} />
+
+## 환경 검증 — 두 경로 공통
+
+### 1. 커널 버전
+
+<Terminal title="커널 버전" commands={[
+  { cmd: "uname -r", output: ["5.15.0-91-generic"] }
+]} />
+
+5.1.x 이상이면 OK. Ubuntu 22.04는 기본 5.15(HWE).
+
+### 2. liburing 버전
+
+<Terminal title="liburing 버전" commands={[
+  { cmd: "pkg-config --modversion liburing", output: ["2.1"] }
+]} />
+
+2.x가 출력되면 OK.
+
+### 3. 컴파일러 버전
+
+<Terminal title="컴파일러 버전" commands={[
+  { cmd: "gcc --version", output: ["gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0"] }
+]} />
+
+gcc 9 이상이면 OK.
+
+### 4. NVMe 디바이스 인식
+
+<Terminal title="가상 NVMe 디바이스 확인" commands={[
+  { cmd: "lsblk -d -o NAME,SIZE,ROTA,TRAN | grep nvme", output: ["nvme0n1  16G  0  nvme"] }
+]} />
+
+`nvme0n1`이 보이고 `ROTA`가 0이면 가상 NVMe가 정상이다.
+
+### 5. 최소 io_uring 프로그램
+
+<CodeBlock language="c" filename="check.c">
+{`#include <liburing.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    struct io_uring ring;
+    int ret = io_uring_queue_init(8, &ring, 0);
+    if (ret < 0) {
+        fprintf(stderr, "io_uring_queue_init failed: %s\\n", strerror(-ret));
+        return 1;
+    }
+    printf("io_uring 준비 완료: SQ entries = 8\\n");
+    io_uring_queue_exit(&ring);
+    return 0;
+}`}
+</CodeBlock>
+
+<Terminal title="컴파일과 실행" commands={[
+  { cmd: "gcc -O2 -o check check.c -luring" },
+  { cmd: "./check", output: ["io_uring 준비 완료: SQ entries = 8"] }
+]} />
+
+이 출력이 나오면 Part 2 이후의 모든 코드를 돌릴 준비가 된 것이다.
+
+<Callout kind="checkpoint">
+**준비 완료 체크리스트 (Windows)**
+
+- 경로 A: WSL2 설치 + Linux 가이드 통과
+  또는
+  경로 B: Windows Hypervisor Platform 활성화 + QEMU 설치 + WHPX 가속 부팅
+- Ubuntu 22.04 Server ISO 다운로드 완료
+- `qemu-img`로 OS 디스크와 NVMe 디스크 생성
+- ISO로 부팅해 Ubuntu 설치 완료 (OpenSSH server 포함)
+- ISO 없이 부팅 후 SSH 접속 가능
+- 게스트에서 `sudo apt install liburing-dev` 완료
+- `uname -r`이 5.1 이상
+- `pkg-config --modversion liburing`이 2.x
+- `lsblk`에 `nvme0n1` 보이고 `ROTA=0`
+- `check` 프로그램이 "io_uring 준비 완료: SQ entries = 8" 출력
+
+위 항목이 모두 통과하면 Part 2로 진행할 수 있다.
+</Callout>
+
+</Section>

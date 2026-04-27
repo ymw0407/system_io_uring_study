@@ -4,9 +4,14 @@ import { HashRouter, Routes, Route } from 'react-router-dom';
 import './styles/global.css';
 import { Layout } from './components/Layout/Layout';
 import Landing from './pages/index';
-import Round1 from './pages/round1';
-import Round2 from './pages/round2';
-import Round3 from './pages/round3';
+import Part1 from './pages/part1';
+import Part2 from './pages/part2';
+import Part3 from './pages/part3';
+import Part4 from './pages/part4';
+import SetupPage from './pages/setup';
+import SetupMacPage from './pages/setup-mac';
+import SetupLinuxPage from './pages/setup-linux';
+import SetupWindowsPage from './pages/setup-windows';
 
 const Tools = lazy(() => import('./pages/tools'));
 const Simulator = lazy(() => import('./pages/simulator'));
@@ -21,9 +26,14 @@ createRoot(root).render(
       <Routes>
         <Route element={<Layout />}>
           <Route index element={<Landing />} />
-          <Route path="round1" element={<Round1 />} />
-          <Route path="round2" element={<Round2 />} />
-          <Route path="round3" element={<Round3 />} />
+          <Route path="part1" element={<Part1 />} />
+          <Route path="part2" element={<Part2 />} />
+          <Route path="part3" element={<Part3 />} />
+          <Route path="part4" element={<Part4 />} />
+          <Route path="setup" element={<SetupPage />} />
+          <Route path="setup-mac" element={<SetupMacPage />} />
+          <Route path="setup-linux" element={<SetupLinuxPage />} />
+          <Route path="setup-windows" element={<SetupWindowsPage />} />
           <Route path="tools" element={<Suspense fallback={null}><Tools /></Suspense>} />
           <Route path="simulator" element={<Suspense fallback={null}><Simulator /></Suspense>} />
           <Route path="emulator" element={<Suspense fallback={null}><Emulator /></Suspense>} />

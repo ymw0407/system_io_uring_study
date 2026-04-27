@@ -11,14 +11,14 @@ const MdxAdaptive = Adaptive as MdxComponent;
 const MdxResult = Result as MdxComponent;
 const MdxConclusion = Conclusion as MdxComponent;
 
-export default function Round3() {
+export default function Part4() {
   return (
     <>
       <MdxWeek3 components={mdxComponents} />
       <MdxAdaptive components={mdxComponents} />
       <MdxResult components={mdxComponents} />
       <MdxConclusion components={mdxComponents} />
-      <PageNav prev={{ to: '/round2', label: 'Round 2: Polling + Workload' }} />
+      <PageNav prev={{ to: '/part3', label: 'Part 3: fio로 정밀 측정' }} />
     </>
   );
 }

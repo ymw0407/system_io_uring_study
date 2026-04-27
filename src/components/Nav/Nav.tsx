@@ -2,9 +2,11 @@ import { Link, useLocation } from 'react-router-dom';
 import * as s from './Nav.css';
 
 const routes = [
-  { to: '/round1', label: 'Round 1' },
-  { to: '/round2', label: 'Round 2' },
-  { to: '/round3', label: 'Round 3' },
+  { to: '/part1', label: 'Part 1' },
+  { to: '/part2', label: 'Part 2' },
+  { to: '/part3', label: 'Part 3' },
+  { to: '/part4', label: 'Part 4' },
+  { to: '/setup', label: 'Setup' },
   { to: '/tools', label: 'Tools' },
 ];
 

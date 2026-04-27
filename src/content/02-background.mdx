@@ -1,61 +1,171 @@
 <Section title="io_uring 배경지식" id="background">
 
 io_uring은 리눅스 5.1(2019)에 도입된 비동기 I/O 인터페이스다.
-핵심 아이디어는 커널과 사용자 공간이 공유하는 링 버퍼를 통해 I/O 요청과 결과를 주고받는 것이다.
-실습에 들어가기 전에, 이 구조가 왜 기존 방식보다 빠른지를 짚고 넘어간다.
+이 절에서는 io_uring이 어떤 문제를 풀려고 등장했는지, 어떤 메커니즘으로 푸는지, 그리고 이 페이지의 다른 주제인 PAS/DPAS와는 어디가 같고 어디가 다른지를 정리한다.
+실습 코드와 이후 그래프 해석은 모두 여기에서 정리한 framework 위에 얹힌다.
 
 <Steps>
-  <Step title="전통적 I/O의 문제">
+  <Step title="전통적 I/O와 epoll/aio의 한계">
 
-`read()`를 호출할 때마다 사용자 공간에서 커널 공간으로 전환이 일어난다.
-요청이 한두 개면 무시할 수 있지만, 초당 수십만 건의 I/O를 처리하는 워크로드에서는 시스템 콜 자체가 병목이 된다.
-`aio`는 Direct I/O만 지원하고, `epoll`은 결국 별도의 `read()`/`write()` 호출이 필요하다는 한계가 있다.
+리눅스에는 io_uring 이전에도 비동기 I/O 도구가 있었다.
+네트워크 영역에서는 `select`/`poll`을 거쳐 `epoll`이 자리를 잡았고, 디스크 영역에서는 `aio`(KAIO)가 도입됐다.
+그러나 두 도구는 모두 절반의 해법이었다.
+
+`epoll`은 1만 명 동시 접속 같은 C10K 문제를 풀려고 만든 도구다.
+사용자가 "이 fd들 중 하나가 읽을 준비됐을 때 알려줘"라고 등록해 두면, 커널이 활동이 있는 fd만 골라 돌려준다.
+fd 수가 늘어도 비용이 거의 일정해서 nginx, Redis, Node.js 이벤트 루프의 기반이 됐다.
+그러나 두 가지 한계가 있다.
+첫째, `epoll`은 "준비됐다"만 알려줄 뿐 실제 `read()`는 사용자가 다시 호출해야 한다 — 매 이벤트마다 시스템 콜이 두 번이다.
+둘째, 일반 디스크 파일은 "읽을 준비"라는 상태가 없어서 `epoll`이 항상 "준비됨"을 돌려준다.
+즉 `epoll`은 사실상 소켓 전용이다.
+
+`aio`는 진짜 비동기 I/O를 노렸다.
+요청을 `io_submit()`으로 보내고 완료를 `io_getevents()`로 모은다 — readiness가 아니라 completion 기반이다.
+그러나 세 가지 함정이 있어서 거의 쓰이지 않았다.
+첫째, `O_DIRECT` 없이 쓰면 조용히 동기 호출로 폴백한다.
+둘째, 소켓에는 통하지 않는다 — `epoll`의 정확한 반대 케이스다.
+셋째, API가 어색하고 부분 지원이 많아 익히기 까다롭다.
+결과적으로 MySQL InnoDB 같은 일부 디스크 헤비 데이터베이스만 울며 겨자 먹기로 썼다.
+
+io_uring은 이 두 도구의 약점을 동시에 푼다.
+fd 종류를 가리지 않고(소켓·파일·타이머·파이프 모두), `O_DIRECT` 강제 없이도 진짜 completion 기반으로 동작하며, 시스템 콜 빈도까지 줄인다.
+"디스크와 네트워크를 같은 도구로, 시스템 콜 비용 없이" 다룰 수 있게 한 것이 io_uring의 본질이다.
+
+<IoApiMatrix />
 
   </Step>
-  <Step title="io_uring의 해법: 공유 링 버퍼">
+  <Step title="공유 링 버퍼 — io_uring의 핵심 트릭">
 
-io_uring은 두 개의 링 버퍼를 `mmap`으로 공유한다.
-SQ(Submission Queue)에 애플리케이션이 요청(SQE)을 넣으면, 커널이 처리 후 결과(CQE)를 CQ(Completion Queue)에 기록한다.
-SQE에는 읽기/쓰기 종류, 파일 디스크립터, 버퍼 주소, 오프셋이 담기고, CQE에는 결과 코드와 식별용 user_data가 들어 있다.
-공유 메모리이므로 요청 제출과 결과 수확 과정에서 메모리 복사가 발생하지 않는다.
+io_uring의 모든 우수성은 한 가지 트릭에서 나온다.
+**사용자 공간과 커널이 같은 메모리 영역을 공유한다.**
+`io_uring_setup()` 시스템 콜로 커널이 메모리를 할당하면, 사용자가 `mmap(MAP_SHARED, ...)`로 그 영역을 자기 주소 공간에 매핑한다.
+가상 주소는 다르지만 물리 페이지는 하나다.
+이후로는 시스템 콜 없이도 사용자가 쓴 비트를 커널이 읽고, 커널이 쓴 비트를 사용자가 읽는다.
+
+<RingBufferDiagram />
+
+공유되는 영역은 세 종류다.
+**SQ ring(Submission Queue)** 은 사용자가 새 요청 인덱스를 넣는 원형 큐, **CQ ring(Completion Queue)** 은 커널이 결과를 넣는 원형 큐다.
+**SQE array** 는 요청 본문 구조체(SQE)가 사는 별도 배열로, SQ ring에는 이 배열의 인덱스만 들어간다.
+SQE 구조체가 64바이트 정도로 큰 반면 인덱스는 작아서, ring과 본문을 분리하면 SQE를 순서 없이 채워 넣고 ring 인덱스로만 순서를 통제할 수 있다.
+
+요청 한 건의 식별은 `user_data` 필드가 담당한다.
+사용자가 SQE에 64비트 값을 박아 두면 (포인터든 정수 ID든), 완료된 CQE에 그 값이 그대로 따라온다.
+100개 요청을 동시에 보내고 완료가 뒤죽박죽 들어와도 `user_data`로 매칭되므로, 어느 결과가 어느 요청의 것인지 잃지 않는다.
+커널은 이 값을 해석하지 않고 단순히 복사만 한다.
 
   </Step>
-  <Step title="기본 동작 흐름">
+  <Step title="한 사이클의 흐름과 비용 절감">
 
-io_uring의 한 사이클은 다섯 단계로 이루어진다.
+io_uring으로 4KB 디스크 읽기를 한 번 처리하는 흐름은 다섯 단계다.
 
-1. `io_uring_get_sqe()` -- SQ에서 빈 슬롯을 하나 받는다
-2. `io_uring_prep_read()` -- 해당 슬롯에 읽기 요청을 채운다
-3. `io_uring_submit()` -- 채워 둔 SQE들을 커널에 배치 제출한다 (시스템 콜 1회)
+1. `io_uring_get_sqe()` -- SQE array에서 빈 슬롯의 포인터를 받는다
+2. `io_uring_prep_read()` -- 그 슬롯에 opcode, fd, 버퍼, 오프셋을 채운다
+3. `io_uring_submit()` -- SQ tail을 갱신해 새 요청이 있음을 알리고, `io_uring_enter()` 시스템 콜로 커널을 깨운다
 4. `io_uring_wait_cqe()` -- CQ에 결과가 도착할 때까지 대기한다
-5. `io_uring_cqe_seen()` -- 결과를 확인했음을 커널에 알린다
+5. `io_uring_cqe_seen()` -- 결과를 확인했음을 표시해 CQ head를 갱신한다
 
-열 개의 읽기를 보내더라도 시스템 콜은 3단계에서 한 번이면 충분하다.
+여기서 io_uring이 줄이는 비용은 두 종류로 나뉜다.
+**Mode switch** 는 같은 프로세스 안에서 user mode와 kernel mode를 오가는 비용으로, 시스템 콜마다 발생한다(수백 ns).
+**Context switch** 는 커널이 프로세스 A에서 B로 갈아치우는 비용으로, 한 번에 1–5μs가 든다.
+전통 `read()`는 호출마다 mode switch가 발생하고 디스크에 막히면 context switch까지 추가된다.
+100번의 `read()`는 200번의 mode switch에 더해 최대 200번의 context switch를 누적한다.
+
+io_uring은 이 두 비용을 동시에 친다.
+SQE 100개를 채운 뒤 `io_uring_submit()` 한 번이면 mode switch는 2번(submit 1, wait 1)으로 줄고, 한 번 자고 한 번 깨면 되니 context switch도 2번 안쪽에 머문다.
+SQPOLL을 켜면 mode switch는 0번이 된다 -- 다음 단계에서 다룬다.
 
   </Step>
-  <Step title="두 가지 폴링 모드">
+  <Step title="SQPOLL과 IOPOLL — 같은 단어, 다른 메커니즘">
 
-기본 모드(interrupt 방식)에서는 커널이 인터럽트를 통해 완료를 알린다.
-이 글에서 "interrupt 방식"이라고 부르는 것은 이 기본 설정을 가리킨다.
+io_uring 셋업 시 두 개의 polling 플래그를 켤 수 있다.
+이름이 비슷해서 혼동하기 쉬운데, **무엇을 폴링하는지가 완전히 다르다**.
 
-`IORING_SETUP_SQPOLL` 플래그를 켜면 커널이 별도의 kthread를 생성하여 SQ를 지속적으로 감시한다.
-애플리케이션은 SQE를 큐에 넣기만 하면 되고, 제출을 위한 시스템 콜이 필요 없다.
-일정 시간(`sq_thread_idle`, 기본 1초) 동안 새 요청이 없으면 스레드는 잠들어 CPU를 양보한다.
+`IORING_SETUP_SQPOLL`은 커널이 별도의 kthread를 만들어 **SQ ring tail(공유 메모리)** 을 폴링하게 한다.
+사용자가 SQE를 큐에 넣고 SQ tail만 갱신하면, kthread가 그걸 보고 알아서 가져간다.
+즉 사용자는 `io_uring_enter()`를 호출하지 않아도 되어, 제출 측 mode switch가 0회가 된다.
+대가는 kthread가 한 코어를 점유한다는 점이다.
+`sq_thread_idle`(기본 1초) 동안 새 요청이 없으면 kthread는 sleep으로 들어가고, 다시 깨우려면 그땐 `io_uring_enter()`를 한 번 불러야 한다.
 
-`IORING_SETUP_IOPOLL`은 디바이스 레벨에서 완료 여부를 폴링하며, `O_DIRECT`가 필수다.
+`IORING_SETUP_IOPOLL`은 디바이스 완료를 인터럽트가 아니라, **사용자 task가 디바이스 CQ(하드웨어 큐)** 를 직접 폴링해서 가져오게 한다.
+인터럽트 자체가 발사되지 않으므로 ISR, wake_up, ready queue 등록, 스케줄러 pick의 전체 체인이 사라진다.
+대가는 사용자 task가 폴링 시간만큼 CPU를 점유한다는 것, 그리고 파일을 `O_DIRECT`로 열어야 한다는 것이다.
+페이지 캐시 경로를 타면 폴링이 의미를 잃기 때문이다.
+
+<Callout kind="tip">
+**`O_DIRECT`란?** `open()`에 줄 수 있는 플래그로, 페이지 캐시를 우회하고 디바이스와 사용자 버퍼 사이에 직접 DMA를 시킨다.
+디폴트 `read()`는 디스크 → 페이지 캐시 → 사용자 버퍼로 두 번 복사하지만, `O_DIRECT`는 캐시를 건너뛰고 한 번에 끝낸다.
+
+| 장점 | 단점 |
+|---|---|
+| 메모리 복사 한 단계 절약 (DMA가 사용자 버퍼에 직접 씀) | 정렬 강제 -- 버퍼 주소·오프셋·크기가 모두 섹터(512B/4KB) 단위 |
+| latency 분산 감소 -- cache hit/miss 변동이 사라져 측정·실시간에 유리 | 캐시 효과 0 -- 같은 블록을 두 번 읽어도 두 번 다 디스크까지 감 |
+| DB(PostgreSQL, MySQL InnoDB)의 자체 buffer pool과 이중 캐싱 충돌 없음 | read-ahead, write-back 같은 커널 최적화 우회 |
+| async I/O 경로(aio, IOPOLL)의 진짜 비동기성 보장 | 단순 throughput 워크로드에서는 오히려 느릴 수 있음 |
+
+IOPOLL이 `O_DIRECT`를 강제하는 이유는 단순하다 -- 캐시 hit으로 즉시 리턴되면 폴링할 디바이스 작업 자체가 없기 때문이다.
+</Callout>
+
+두 플래그는 서로 독립적이라 4가지 조합이 가능하다.
+SQPOLL만 켜면 제출 측 비용을 없애고, IOPOLL만 켜면 완료 측 비용을 없앤다.
+둘 다 켜면 두 코어를 거의 다 태우는 대신 latency를 한계까지 짠다 -- HFT나 데이터베이스 commit path 같은 워크로드에서 쓰이는 극한 튜닝이다.
+
+<PollingTargets />
 
   </Step>
 </Steps>
 
 <Callout kind="note">
-SQPOLL과 IOPOLL은 별개의 메커니즘이다.
-SQPOLL은 커널 스레드가 제출 큐(SQ)를 폴링하여 시스템 콜 없이 요청을 수거하는 것이고, IOPOLL은 디바이스 레벨에서 완료 큐를 폴링하여 인터럽트 없이 결과를 수거하는 것이다.
-이 실습에서는 주로 SQPOLL을 다루며, IOPOLL은 별도로 언급할 때만 등장한다.
+SQPOLL은 **요청 큐(SQ ring)** 를 폴링한다. 사용자에서 커널로 가는 통신 비용을 없앤다.
+IOPOLL은 **디바이스 완료 큐(CQ)** 를 폴링한다. 디바이스에서 사용자로 오는 인터럽트 비용을 없앤다.
+같은 "polling" 단어를 쓰지만 화살표 방향이 정반대다.
 </Callout>
 
-마지막으로 Queue Depth(QD) 개념을 알아야 한다.
-QD는 동시에 in-flight 상태, 즉 제출되었지만 아직 완료되지 않은 I/O 요청의 수다.
-QD=1이면 장치의 내부 병렬성을 활용하지 못하지만, QD를 높이면 장치가 여러 요청을 동시에 처리하여 처리량이 늘어난다.
+### io_uring과 PAS/DPAS — 다루는 비용의 축이 다르다
+
+이 페이지는 io_uring과 PAS/DPAS를 함께 다루는데, 두 도구가 같은 latency 방정식의 **다른 항을 친다**는 점을 분명히 해야 한다.
+한 번의 I/O latency를 분해하면 크게 세 부분이며, 두 도구는 그중 다른 단계를 푼다.
+
+<CostAxis />
+
+io_uring은 **제출 측 비용을 친다**.
+시스템 콜과 메모리 복사를 줄이고, batching으로 mode switch와 context switch를 amortize한다.
+SQPOLL을 켜면 제출 측 시스템 콜 자체를 0으로 만든다.
+다만 io_uring은 사용자 task가 어떻게 깨어날지에 대한 정책은 갖지 않는다 -- 기본 모드는 평범한 sleep과 인터럽트 기반 wake-up을 그대로 쓴다.
+
+PAS/DPAS는 **완료 측의 wake-up 타이밍을 친다**.
+정확히는 "사용자 task가 언제 깨어나서 디바이스 CQ를 확인할지"를 결정하는 메커니즘이다.
+폴링 모드에서 사용자 task는 자기 자신에게 hrtimer를 걸고 잠들었다가 타이머가 만료되면 깨어나 CQ를 폴링한다.
+이때 sleep 길이를 너무 짧게 잡으면 깨어났을 때 디바이스가 아직 안 끝난 상태(UNDER)이고, 너무 길게 잡으면 이미 한참 전에 끝나 있는 상태(OVER)다.
+PAS는 binary feedback으로 매 I/O마다 sleep 길이를 학습하며, DPAS는 PAS가 통하지 않는 환경(주로 CPU contention)을 감지해 모드 자체를 갈아탄다.
+
+PAS/DPAS는 디바이스에서 사용자로 데이터가 전달되는 메커니즘 자체를 바꾸지 않는다 -- DMA와 메모리 매핑은 그대로다.
+바꾸는 것은 **언제 깨어날지의 타이밍 하나**다.
+그래서 io_uring과 PAS/DPAS는 같은 시스템 안에서 충돌 없이 합쳐진다.
+구체적으로 `IORING_SETUP_IOPOLL`이 켜진 io_uring은 블록 레이어의 폴링 경로(`blk_mq_poll → blk_mq_poll_hybrid`)로 들어가는데, 그 안이 PAS/DPAS의 거주지다.
+즉 IOPOLL 모드의 io_uring은 자동으로 PAS/DPAS의 정책을 받게 된다.
+
+| 도구 | 푸는 비용 | 거주하는 커널 코드 |
+|---|---|---|
+| io_uring | 사용자/커널 통신 (mode switch, context switch, 메모리 복사) | `io_uring/` 서브시스템 |
+| PAS/DPAS | 완료 측 self-wake 타이밍 | `block/blk-mq.c::blk_mq_poll_hybrid()` |
+
+두 도구가 프로세스 컨텍스트에서 도는 코드라는 점은 같지만, 만지는 변수가 다르고 살고 있는 커널 서브시스템도 다르다.
+
+### Queue Depth — throughput과 전략 우열의 손잡이
+
+Queue Depth(QD)는 동시에 in-flight 상태, 즉 제출되었지만 아직 완료되지 않은 I/O 요청의 수다.
+SQ 크기와는 다른 개념으로, SQ는 요청을 담을 수 있는 공간이고 QD는 현재 실제로 대기 중인 부하다(SQ 크기 ≥ QD).
+
+NVMe는 스펙상 65,535개의 큐 × 큐당 65,535개 명령을 허용하지만, 컨슈머 SSD도 보통 8–16개의 hardware queue가 동시에 일한다.
+QD=1로 돌리면 이 병렬성을 거의 활용하지 못해 같은 디바이스의 throughput이 10,000 IOPS 수준에 머물지만, QD=64로 올리면 같은 디바이스가 500,000 IOPS 이상까지 올라간다.
+즉 QD는 throughput의 1차 손잡이다.
+
+흥미로운 점은 QD가 throughput뿐 아니라 **최적 완료 전략의 우열까지 바꾼다**는 것이다.
+QD=1에서는 완료를 한 건씩 기다리므로 polling이 유리하다 -- 1–5μs의 인터럽트 비용을 절약하면 100μs latency의 1–5%를 줄이는 셈이다.
+QD가 높아지면 완료가 빗발쳐 인터럽트 coalescing의 효율이 살아나고, 사용자 task의 폴링 CPU가 오히려 새 SQE 제출 자체를 느리게 만든다.
+어느 QD에서 polling이 interrupt로 역전되는지는 디바이스, 워크로드, CPU 부하에 따라 달라지므로 고정된 임계값은 없다 -- 이것이 페이지 후반의 adaptive 정책이 필요한 이유다.
+
 이후 실습에서는 QD를 1, 4, 16, 64, 256으로 바꿔 가며 각 전략의 성능 변화를 직접 관찰한다.
 
 </Section>
