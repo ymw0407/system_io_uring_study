@@ -1,143 +1,230 @@
 <Section title="Linux 셋업 — QEMU + KVM" id="setup-linux">
 
-이 페이지는 호스트가 **Linux**일 때 실습 환경을 처음부터 만드는 방법을 다룬다.
+이 페이지는 [dpas-lab의 Linux 가이드](https://dpas-lab.pages.dev/setup-linux.html)를 기준으로 작성됐다.
+DPAS 자체는 다루지 않으므로 "커널 5.18 업그레이드"와 "NVMe `poll_queues` 활성화" 단계는 제외했고, 그 외엔 원본 명령을 그대로 따라간다.
 다른 OS는 [Setup 인덱스](/setup)로 돌아가서 선택한다.
-KVM은 보통 Linux 커널에 이미 포함돼 있어 추가 모듈 설치가 거의 없고, 가속을 켜는 데 필요한 권한만 확인하면 된다.
+
+## 0. 사전 확인
+
+아키텍처와 KVM 가용성을 확인한다.
+
+<Terminal title="아키텍처 및 KVM 확인" commands={[
+  { cmd: "uname -m", output: ["x86_64"] },
+  { cmd: "egrep -c '(vmx|svm)' /proc/cpuinfo", output: ["8"] },
+  { cmd: "lsmod | grep kvm", output: ["kvm_intel  ...", "kvm  ..."] }
+]} />
+
+- `vmx`: Intel VT-x 지원
+- `svm`: AMD-V 지원
+- 결과가 0이거나 모듈이 안 보이면 KVM 비활성. 아래 주의사항 참조.
+
+<Callout kind="warn">
+**KVM 사용 불가 환경**
+이미 VirtualBox/VMware VM 안에서 작업 중이면 nested KVM이 필요하다.
+- VirtualBox: 머신 설정 → 시스템 → 가속 → "VT-x/AMD-V 중첩 페이징" 활성화
+- VMware: VMX 파일에 `vhv.enable = "TRUE"` 추가 후 재시작
+
+nested 활성화 확인:
+
+```bash
+cat /sys/module/kvm_intel/parameters/nested   # Y 이면 OK
+cat /sys/module/kvm_amd/parameters/nested     # AMD의 경우
+```
+
+KVM을 못 쓰는 경우 `-enable-kvm`을 빼고 소프트웨어 에뮬레이션으로 실행 (느림).
+</Callout>
 
 ## 1. QEMU 설치
 
-배포판 패키지로 설치한다.
+### Ubuntu / Debian
 
 <Terminal title="Ubuntu / Debian" commands={[
   { cmd: "sudo apt update" },
   { cmd: "sudo apt install -y qemu-system-x86 qemu-utils" }
 ]} />
 
+### Fedora / RHEL / CentOS Stream
+
 <Terminal title="Fedora" commands={[
   { cmd: "sudo dnf install -y qemu-system-x86 qemu-img" }
 ]} />
 
+### Arch Linux
+
 <Terminal title="Arch" commands={[
-  { cmd: "sudo pacman -S qemu-full" }
+  { cmd: "sudo pacman -S qemu-system-x86 qemu-img" }
 ]} />
 
-설치 후 버전 확인.
+### 설치 확인
 
-<Terminal title="QEMU 버전" commands={[
-  { cmd: "qemu-system-x86_64 --version", output: ["QEMU emulator version 8.2.0"] }
+<Terminal title="버전 확인" commands={[
+  { cmd: "qemu-system-x86_64 --version" },
+  { cmd: "qemu-img --version" }
 ]} />
 
-## 2. KVM 가용성 확인
+### KVM 권한 설정
 
-KVM이 활성화되어 있고 권한이 있는지 확인한다.
+`qemu-system-x86_64` 실행 시 `permission denied /dev/kvm` 오류가 나면 현재 사용자를 kvm 그룹에 추가해야 한다.
 
-<Terminal title="KVM 가용성" commands={[
-  { cmd: "ls /dev/kvm && egrep -c '(vmx|svm)' /proc/cpuinfo", output: ["/dev/kvm", "8"] }
+<Terminal title="kvm 그룹 가입" commands={[
+  { cmd: "sudo usermod -aG kvm $USER" },
+  { cmd: "newgrp kvm" },
+  { cmd: "ls -l /dev/kvm", output: ["crw-rw---- 1 root kvm  ...  /dev/kvm"] }
 ]} />
 
-`/dev/kvm`이 존재하고 CPU 플래그(vmx 또는 svm)가 1 이상이면 KVM 가속이 가능하다.
-`/dev/kvm` 권한이 없다는 에러가 나면 다음을 실행하고 재로그인한다.
+`group: kvm`으로 보이면 OK.
 
-<Terminal title="KVM 그룹 가입" commands={[
-  { cmd: "sudo usermod -aG kvm $USER" }
+## 2. Ubuntu 22.04 ISO 다운로드
+
+<Terminal title="ISO 다운로드" commands={[
+  { cmd: "mkdir -p ~/qemu-lab && cd ~/qemu-lab" },
+  { cmd: "wget -O ubuntu-22.04-server-amd64.iso https://releases.ubuntu.com/22.04/ubuntu-22.04.5-live-server-amd64.iso" },
+  { cmd: "ls -lh ubuntu-22.04-server-amd64.iso" }
 ]} />
 
-## 3. Ubuntu ISO 다운로드
+## 3. 디스크 이미지 생성
 
-[releases.ubuntu.com/22.04](https://releases.ubuntu.com/22.04/)에서 **Ubuntu 22.04 LTS Server**의 ISO를 받는다.
-파일명은 보통 `ubuntu-22.04.x-live-server-amd64.iso` 형태다.
-받은 파일을 실습 디렉터리에 두고, 다음 단계의 명령은 모두 그 디렉터리에서 실행한다.
-
-<Terminal title="실습 디렉터리 만들기" commands={[
-  { cmd: "mkdir ~/io-uring-lab && cd ~/io-uring-lab" }
-]} />
-
-`wget`이나 `curl`로 직접 받을 수도 있다.
-
-<Terminal title="curl로 ISO 다운로드 (예시)" commands={[
-  { cmd: "curl -LO https://releases.ubuntu.com/22.04/ubuntu-22.04.5-live-server-amd64.iso" }
-]} />
-
-## 4. 디스크 이미지 생성
-
-OS용 디스크와 실험용 가상 NVMe 디스크를 분리해서 만든다.
-나누는 이유는 NVMe 드라이버를 다시 로드하거나 디스크를 초기화할 때 OS를 건드리지 않기 위해서다.
+<Callout kind="note">
+**디스크 분리 이유** — OS가 NVMe 위에 있으면 NVMe 드라이버 옵션을 바꿀 때 시스템이 멈출 수 있다.
+OS는 virtio 디스크(`/dev/vda`)에, 실험 대상은 NVMe 디바이스(`/dev/nvme0n1`)에 분리해 둔다.
+</Callout>
 
 <Terminal title="디스크 이미지 생성" commands={[
+  { cmd: "cd ~/qemu-lab" },
   { cmd: "qemu-img create -f qcow2 ubuntu.qcow2 30G" },
-  { cmd: "qemu-img create -f raw nvme.raw 16G" }
+  { cmd: "qemu-img create -f raw nvme_disk.raw 16G" }
 ]} />
 
-`ubuntu.qcow2`는 OS용 30GB qcow2 이미지(실제 크기는 사용량만큼만 늘어남), `nvme.raw`는 실험 대상이 될 16GB raw 이미지다.
+`ubuntu.qcow2`는 OS용 30GB qcow2(실제 크기는 사용량만큼 늘어남), `nvme_disk.raw`는 실험 대상 16GB raw.
+raw 포맷은 `O_DIRECT`를 정확히 지원하기 위함이다.
 
-## 5. ISO로 부팅해서 Ubuntu 설치 (최초 1회)
+## 4. Ubuntu 22.04 설치
 
-ISO와 빈 디스크 두 개를 함께 부팅한다.
+<Callout kind="warn">
+**WSL 사용자 주의** — WSL 환경에서는 `-nographic` 옵션이 설치 과정에서 문제를 일으킬 수 있다.
+이 경우 `-nographic`을 제거하면 WSLg가 QEMU GUI 창을 자동으로 띄워 정상적으로 설치할 수 있다.
+설치 완료 후 GRUB 설정에 `console=ttyS0`을 추가하면 이후 `-nographic` 모드를 쓸 수 있다:
+
+```bash
+sudo sed -i 's/^GRUB_CMDLINE_LINUX=""/GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"/' /etc/default/grub
+sudo update-grub
+```
+</Callout>
 
 <CodeBlock language="bash" filename="install-vm-linux.sh">
-{`#!/bin/bash
+{`cd ~/qemu-lab
 qemu-system-x86_64 \\
-  -enable-kvm \\
   -m 4G -smp 4 \\
-  -cdrom ubuntu-22.04.5-live-server-amd64.iso \\
-  -drive file=ubuntu.qcow2,format=qcow2,if=virtio \\
-  -drive file=nvme.raw,format=raw,if=none,id=nvme0 \\
-  -device nvme,drive=nvme0,serial=test \\
-  -netdev user,id=net0,hostfwd=tcp::2222-:22 \\
-  -device virtio-net-pci,netdev=net0`}
-</CodeBlock>
-
-`-nographic`을 빼면 별도의 QEMU 창이 뜨고 거기서 마우스/키보드로 Ubuntu 설치 위저드를 진행할 수 있다.
-
-설치 위저드에서 챙길 것:
-
-- 언어·키보드 기본값으로 진행
-- 네트워크: DHCP 자동 (포트 포워딩이 알아서 처리)
-- 디스크: `ubuntu.qcow2` 전체를 LVM으로 사용 (NVMe 디스크는 건드리지 않음)
-- 사용자명·비밀번호 설정
-- **"Install OpenSSH server" 체크 필수** (이후 SSH 접속에 사용)
-
-설치 완료 메시지가 뜨면 VM을 종료한다.
-
-## 6. 설치된 VM 부팅
-
-이후로는 ISO 없이 바로 부팅한다.
-
-<CodeBlock language="bash" filename="run-vm-linux.sh">
-{`#!/bin/bash
-qemu-system-x86_64 \\
   -enable-kvm \\
-  -m 4G -smp 4 \\
-  -drive file=ubuntu.qcow2,format=qcow2,if=virtio \\
-  -drive file=nvme.raw,format=raw,if=none,id=nvme0 \\
-  -device nvme,drive=nvme0,serial=test \\
-  -netdev user,id=net0,hostfwd=tcp::2222-:22 \\
-  -device virtio-net-pci,netdev=net0 \\
+  -drive file=ubuntu.qcow2,if=virtio,format=qcow2 \\
+  -cdrom ubuntu-22.04-server-amd64.iso \\
+  -boot d \\
+  -net nic -net user,hostfwd=tcp::2222-:22 \\
   -nographic`}
 </CodeBlock>
 
-각 옵션의 역할:
+<Callout kind="warn">
+**Ubuntu 서버 설치 시 주의사항**
 
-- `-enable-kvm` — Linux의 KVM으로 하드웨어 가속
-- `-m 4G -smp 4` — 게스트에 RAM 4GB, vCPU 4개
-- `-drive ... if=virtio` — OS 디스크
-- `-drive ... id=nvme0` + `-device nvme,...` — 가상 NVMe 디바이스 (실험 대상)
-- `-netdev ... hostfwd=tcp::2222-:22` — 호스트 2222 → 게스트 22 SSH 포워딩
-- `-nographic` — 별도 창 없이 현재 터미널에 콘솔 연결
+- 언어·키보드·네트워크는 기본값
+- **`openssh-server` 반드시 선택** (스페이스바로 체크)
+- Storage: LVM 설정 시 디스크 전체를 사용하도록 설정. 기본값이 절반만 할당하므로, 설치 후 다음 명령으로 확장하거나 설치 중 "Custom storage layout"에서 전체 크기를 할당:
 
-부팅 로그가 끝나고 `login:` 프롬프트가 뜨면 거기서는 그대로 두고, 새 터미널에서 SSH로 접속하는 편이 편하다.
+  ```bash
+  sudo lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
+  sudo resize2fs /dev/ubuntu-vg/ubuntu-lv
+  ```
+- 추가 패키지: 선택 안 해도 됨
+- 설치 완료 후 "Reboot Now" → 콘솔에서 `Ctrl-A` + `X`로 QEMU 종료
+</Callout>
 
-## 7. SSH 접속
+## 5. 설치 후 VM 기동 (NVMe 포함)
 
-새 터미널에서:
+설치 완료 후 `-cdrom`을 빼고 NVMe 디스크를 붙여서 기동한다.
+
+<CodeBlock language="bash" filename="run-vm-linux.sh">
+{`cd ~/qemu-lab
+qemu-system-x86_64 \\
+  -m 4G -smp 4 \\
+  -enable-kvm \\
+  -drive file=ubuntu.qcow2,if=virtio,format=qcow2 \\
+  -drive file=nvme_disk.raw,id=nvm,if=none,format=raw \\
+  -device nvme,id=nvme0,serial=deadbeef \\
+  -device nvme-ns,drive=nvm,bus=nvme0,nsid=1,logical_block_size=512,physical_block_size=512 \\
+  -net nic -net user,hostfwd=tcp::2222-:22 \\
+  -nographic`}
+</CodeBlock>
+
+VM 부팅 완료 후 SSH 접속:
 
 <Terminal title="SSH 접속" commands={[
-  { cmd: "ssh -p 2222 ubuntu@localhost" }
+  { cmd: "ssh -p 2222 <username>@localhost" }
 ]} />
 
-설치 시 만든 사용자명·비밀번호로 접속한다.
+처음 접속 시 host key 경고가 나오면 `yes` 입력.
 
-## 8. 게스트 안에서 liburing 설치
+<Callout kind="note">
+이전에 다른 VM이 같은 포트(2222)에 있었다면 호스트 키 충돌로 SSH가 거부될 수 있다.
+그때는 다음 명령으로 옛 키를 지우고 다시 접속한다.
+
+```bash
+ssh-keygen -R "[localhost]:2222"
+```
+</Callout>
+
+### 옵션 한 줄 해설
+
+위 두 명령(설치 단계 4와 기동 단계 5)에 등장한 모든 QEMU 옵션을 정리한다.
+같은 옵션이 두 단계에 공통이고, 차이는 ISO 관련 옵션(`-cdrom`, `-boot d`)과 NVMe 디바이스 옵션뿐이다.
+
+**리소스 할당 (공통)**
+
+- `-m 4G` — 게스트에 할당할 RAM 크기. 4GB는 Ubuntu Server + apt 패키지 + io_uring 빌드에 충분.
+- `-smp 4` — 게스트에 노출할 vCPU 수. 호스트 코어가 적으면 2로 줄여도 된다.
+- `-enable-kvm` — Linux의 KVM으로 하드웨어 가속. `/dev/kvm`에 접근 권한이 있어야 한다 (kvm 그룹 가입 필요).
+
+**OS 디스크 (공통)**
+
+- `-drive file=ubuntu.qcow2,if=virtio,format=qcow2` — Ubuntu가 설치되는 OS 디스크.
+  - `if=virtio` — virtio 인터페이스로 게스트에 노출 (`/dev/vda`로 보임). NVMe와 분리하는 핵심.
+  - `format=qcow2` — Copy-on-Write 포맷. 30GB로 만들어도 실제 사용량만큼만 디스크를 점유.
+
+**ISO 관련 (4단계 설치 시에만)**
+
+- `-cdrom <iso>` — ISO 파일을 가상 CD-ROM으로 마운트.
+- `-boot d` — CD-ROM(`d`)에서 부팅하라는 명시적 지정. 빠지면 빈 OS 디스크에서 부팅을 시도해 실패한다.
+
+**NVMe 디스크 (5단계 기동 시에만)**
+
+NVMe는 세 줄로 나눠서 정의한다. 각 줄이 디스크 스택의 다른 레이어를 담당한다.
+
+- `-drive file=nvme_disk.raw,id=nvm,if=none,format=raw` — 백킹 스토리지 등록.
+  - `if=none` — 어떤 인터페이스에도 자동 연결하지 말고 ID만 등록. 다음 줄의 `-device`가 이걸 가져다 쓴다.
+  - `format=raw` — 그대로의 raw 디스크. `O_DIRECT`가 정확히 동작하려면 raw가 필수.
+- `-device nvme,id=nvme0,serial=deadbeef` — NVMe 컨트롤러 디바이스 추가.
+  - `serial=deadbeef` — 임의 식별자 (필수 필드, 값 자체는 의미 없음).
+- `-device nvme-ns,drive=nvm,bus=nvme0,nsid=1,logical_block_size=512,physical_block_size=512` — 컨트롤러 아래에 namespace를 만들고 위 `nvm` 드라이브를 연결.
+  - `nsid=1` — namespace ID. 게스트에서 `/dev/nvme0n1`의 마지막 `1`이 이 값.
+  - `logical_block_size`, `physical_block_size` — 섹터 크기. 512는 가장 호환성 좋은 값.
+
+이 세 줄이 모두 있어야 게스트에 `/dev/nvme0n1`이 보인다.
+하나라도 빠지면 디바이스 인식이 안 된다.
+
+**네트워크 (공통)**
+
+- `-net nic -net user,hostfwd=tcp::2222-:22` — user-mode 네트워킹 + 포트 포워딩.
+  - `-net nic` — 게스트에 가상 NIC 추가.
+  - `-net user` — QEMU의 user-mode 네트워크 백엔드(NAT). 게스트가 호스트 인터넷을 빌려 쓴다.
+  - `hostfwd=tcp::2222-:22` — 호스트 2222 포트를 게스트의 22(SSH)로 포워딩.
+
+**디스플레이 (공통)**
+
+- `-nographic` — 그래픽 출력 없이 시리얼 콘솔을 현재 터미널에 직접 연결.
+  - 별도 GUI 창이 뜨지 않아 원격 Linux 서버처럼 다룰 수 있다.
+  - 종료는 `Ctrl-A` + `X` (시리얼 콘솔에서의 QEMU 단축키).
+  - WSL 환경에서만 설치 단계에 문제가 될 수 있어 위 경고 박스 참조.
+
+## 6. Guest 안에서 liburing 설치
 
 이후 명령은 모두 **게스트(VM) 안의 셸에서** 실행한다.
 
@@ -146,41 +233,33 @@ qemu-system-x86_64 \\
   { cmd: "sudo apt install -y liburing-dev gcc build-essential pkg-config" }
 ]} />
 
-## 9. 환경 검증
+Ubuntu 22.04의 기본 커널(5.15)이 io_uring(5.1+)을 충분히 지원하므로 별도의 커널 업그레이드는 필요 없다.
 
-### 9.1 커널 버전
+## 7. 환경 검증
+
+### 7.1 커널 버전
 
 <Terminal title="커널 버전" commands={[
   { cmd: "uname -r", output: ["5.15.0-91-generic"] }
 ]} />
 
-5.1.x 이상이면 OK. Ubuntu 22.04는 기본 5.15(HWE).
+5.1.x 이상이면 OK.
 
-### 9.2 liburing 버전
+### 7.2 liburing 버전
 
 <Terminal title="liburing 버전" commands={[
   { cmd: "pkg-config --modversion liburing", output: ["2.1"] }
 ]} />
 
-2.x가 출력되면 OK.
-
-### 9.3 컴파일러 버전
-
-<Terminal title="컴파일러 버전" commands={[
-  { cmd: "gcc --version", output: ["gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0"] }
-]} />
-
-gcc 9 이상이면 OK.
-
-### 9.4 NVMe 디바이스 인식
+### 7.3 NVMe 디바이스 인식
 
 <Terminal title="가상 NVMe 디바이스 확인" commands={[
-  { cmd: "lsblk -d -o NAME,SIZE,ROTA,TRAN | grep nvme", output: ["nvme0n1  16G  0  nvme"] }
+  { cmd: "lsblk -d -o NAME,SIZE,ROTA,TRAN", output: ["NAME    SIZE ROTA TRAN", "vda      30G    0 virtio   # OS 디스크", "nvme0n1  16G    0 nvme     # 실험 대상"] }
 ]} />
 
-`nvme0n1`이 보이고 `ROTA`가 0이면 가상 NVMe가 정상적으로 게스트에 노출된 상태다.
+`vda`(OS, virtio)와 `nvme0n1`(실험, NVMe)이 분리되어 보이면 정상.
 
-### 9.5 최소 io_uring 프로그램
+### 7.4 최소 io_uring 프로그램
 
 <CodeBlock language="c" filename="check.c">
 {`#include <liburing.h>
@@ -205,21 +284,63 @@ int main(void) {
   { cmd: "./check", output: ["io_uring 준비 완료: SQ entries = 8"] }
 ]} />
 
-이 출력이 나오면 Part 2 이후의 모든 코드를 돌릴 준비가 된 것이다.
+## 편의 스크립트
+
+반복 기동을 위해 부팅 명령을 스크립트로 저장해 두면 편하다.
+
+<CodeBlock language="bash" filename="~/qemu-lab/start-vm.sh">
+{`#!/bin/bash
+cd ~/qemu-lab
+qemu-system-x86_64 \\
+  -m 4G -smp 4 \\
+  -enable-kvm \\
+  -drive file=ubuntu.qcow2,if=virtio,format=qcow2 \\
+  -drive file=nvme_disk.raw,id=nvm,if=none,format=raw \\
+  -device nvme,id=nvme0,serial=deadbeef \\
+  -device nvme-ns,drive=nvm,bus=nvme0,nsid=1,logical_block_size=512,physical_block_size=512 \\
+  -net nic -net user,hostfwd=tcp::2222-:22 \\
+  -nographic "$@"`}
+</CodeBlock>
+
+<Terminal title="실행 권한 부여 + alias 등록" commands={[
+  { cmd: "chmod +x ~/qemu-lab/start-vm.sh" },
+  { cmd: "echo 'alias vm-start=\"~/qemu-lab/start-vm.sh\"' >> ~/.bashrc" },
+  { cmd: "echo 'alias vm-ssh=\"ssh -p 2222 <username>@localhost\"' >> ~/.bashrc" },
+  { cmd: "source ~/.bashrc" }
+]} />
+
+백그라운드 실행 (데몬 모드):
+
+<Terminal title="백그라운드 실행" commands={[
+  { cmd: "~/qemu-lab/start-vm.sh -daemonize -pidfile ~/qemu-lab/vm.pid" },
+  { cmd: "kill $(cat ~/qemu-lab/vm.pid)   # VM 종료" }
+]} />
+
+## 트러블슈팅
+
+| 증상 | 원인 | 해결 |
+|---|---|---|
+| `Could not access KVM kernel module: No such file or directory` | KVM 모듈 미로드 또는 권한 없음 | `sudo modprobe kvm_intel` (또는 `kvm_amd`), `sudo usermod -aG kvm $USER` |
+| `permission denied /dev/kvm` | kvm 그룹 미등록 | `newgrp kvm` 후 재시도 |
+| `nvme0n1` 디바이스 없음 | `-device nvme` 옵션 누락 | 5단계 명령의 NVMe 세 줄 확인 |
+| ISO 부팅 실패 (UEFI 셸로 떨어짐) | `-boot d` 누락 | 4단계 명령에 `-boot d` 포함 확인 |
+| SSH 접속 거부 | `openssh-server` 미설치 | 게스트에서 `sudo apt install openssh-server` 후 VM 재시작 |
+| SSH `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED` | 이전 VM의 호스트 키와 충돌 | `ssh-keygen -R "[localhost]:2222"` |
+| nested KVM 미지원 | VM 안의 VM 환경 | 호스트 hypervisor에서 nested 가상화 활성화, 또는 `-enable-kvm` 제거 |
 
 <Callout kind="checkpoint">
 **준비 완료 체크리스트 (Linux)**
 
 - 호스트에 QEMU 설치 완료, `qemu-system-x86_64 --version` 정상
-- `/dev/kvm` 접근 가능 (현재 사용자가 kvm 그룹)
-- Ubuntu 22.04 Server ISO 다운로드 완료
+- KVM 모듈 로드, kvm 그룹 가입, `/dev/kvm` 접근 가능
+- Ubuntu 22.04 Server amd64 ISO 다운로드 완료
 - `qemu-img`로 OS 디스크와 NVMe 디스크 생성
-- ISO로 부팅해 Ubuntu 설치 완료 (OpenSSH server 포함)
-- ISO 없이 부팅 후 SSH 접속 가능
+- ISO로 부팅해 Ubuntu 설치 완료 (openssh-server 포함, LVM 전체 디스크 할당)
+- ISO 없이 NVMe 포함 부팅 후 SSH 접속 가능
 - 게스트에서 `sudo apt install liburing-dev` 완료
 - `uname -r`이 5.1 이상
 - `pkg-config --modversion liburing`이 2.x
-- `lsblk`에 `nvme0n1` 보이고 `ROTA=0`
+- `lsblk`에 `vda`와 `nvme0n1` 모두 보임
 - `check` 프로그램이 "io_uring 준비 완료: SQ entries = 8" 출력
 
 위 항목이 모두 통과하면 Part 2로 진행할 수 있다.
