@@ -33,9 +33,10 @@ interface ChartProps {
   xLabel?: string;
   yLabel?: string;
   caption?: string;
+  yScale?: 'linear' | 'log';
 }
 
-export function Chart({ kind, data, xKey, series, xLabel, yLabel, caption }: ChartProps) {
+export function Chart({ kind, data, xKey, series, xLabel, yLabel, caption, yScale = 'linear' }: ChartProps) {
   const resolveColor = (c: string) => COLOR_MAP[c] ?? c;
 
   const chartContent = kind === 'line' ? (
@@ -50,6 +51,9 @@ export function Chart({ kind, data, xKey, series, xLabel, yLabel, caption }: Cha
       <YAxis
         stroke={vars.color.textMuted}
         tick={{ fill: vars.color.textMuted, fontSize: 12 }}
+        scale={yScale}
+        domain={yScale === 'log' ? ['auto', 'auto'] : undefined}
+        allowDataOverflow={yScale === 'log'}
         label={yLabel ? { value: yLabel, angle: -90, position: 'insideLeft', fill: vars.color.textMuted, fontSize: 13 } : undefined}
       />
       <Tooltip
@@ -87,6 +91,9 @@ export function Chart({ kind, data, xKey, series, xLabel, yLabel, caption }: Cha
       <YAxis
         stroke={vars.color.textMuted}
         tick={{ fill: vars.color.textMuted, fontSize: 12 }}
+        scale={yScale}
+        domain={yScale === 'log' ? ['auto', 'auto'] : undefined}
+        allowDataOverflow={yScale === 'log'}
         label={yLabel ? { value: yLabel, angle: -90, position: 'insideLeft', fill: vars.color.textMuted, fontSize: 13 } : undefined}
       />
       <Tooltip

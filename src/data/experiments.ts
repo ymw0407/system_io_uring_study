@@ -39,12 +39,14 @@ export interface FioQdLatencyPoint {
   iopoll: number;    // μs
 }
 
+/* Bare-metal Arch Linux 6.19, /dev/nvme0n1 직접 read, nvme.poll_queues=4, 8-core.
+   30s × 5 QDs × 3 modes. (참고: QEMU emulated NVMe에서는 세 모드가 거의 동일한 곡선이었음.) */
 export const fioQdLatency: FioQdLatencyPoint[] = [
-  { qd: 1,   interrupt: 95,  sqpoll: 78,  iopoll: 72 },
-  { qd: 4,   interrupt: 102, sqpoll: 72,  iopoll: 65 },
-  { qd: 16,  interrupt: 118, sqpoll: 70,  iopoll: 58 },
-  { qd: 64,  interrupt: 145, sqpoll: 74,  iopoll: 62 },
-  { qd: 256, interrupt: 210, sqpoll: 92,  iopoll: 78 },
+  { qd: 1,   interrupt: 48,  sqpoll: 42,  iopoll: 41  },
+  { qd: 4,   interrupt: 45,  sqpoll: 43,  iopoll: 57  },
+  { qd: 16,  interrupt: 46,  sqpoll: 46,  iopoll: 66  },
+  { qd: 64,  interrupt: 120, sqpoll: 120, iopoll: 135 },
+  { qd: 256, interrupt: 476, sqpoll: 480, iopoll: 477 },
 ];
 
 /** CPU Load vs Throughput — fio 측정, QD=16 */
@@ -54,10 +56,11 @@ export interface FioCpuThroughputPoint {
   sqpoll: number;    // MB/s
 }
 
+/* Bare-metal Arch, QD=16, stress-ng --cpu N. */
 export const fioCpuThroughput: FioCpuThroughputPoint[] = [
-  { cpuLoad: 'Idle',  interrupt: 420, sqpoll: 580 },
-  { cpuLoad: '50%',   interrupt: 400, sqpoll: 510 },
-  { cpuLoad: '100%',  interrupt: 380, sqpoll: 340 },
+  { cpuLoad: 'Idle',  interrupt: 1345, sqpoll: 1355 },
+  { cpuLoad: '50%',   interrupt: 1339, sqpoll: 1353 },
+  { cpuLoad: '100%',  interrupt: 1025, sqpoll: 564  },
 ];
 
 /** CPU usage per mode — fio 측정, QD=16 */
@@ -67,10 +70,11 @@ export interface FioCpuUsagePoint {
   sysCpu: number; // % (from jobs[0].sys_cpu)
 }
 
+/* Bare-metal Arch, QD=16. usr/sys는 fio 프로세스 통계만 — SQPOLL의 별도 커널 kthread는 미포함. */
 export const fioCpuUsage: FioCpuUsagePoint[] = [
-  { mode: 'Interrupt', usrCpu: 5,  sysCpu: 8 },
-  { mode: 'SQPOLL',    usrCpu: 3,  sysCpu: 95 },
-  { mode: 'IOPOLL',    usrCpu: 12, sysCpu: 6 },
+  { mode: 'Interrupt', usrCpu: 6,   sysCpu: 19 },
+  { mode: 'SQPOLL',    usrCpu: 100, sysCpu: 0  },
+  { mode: 'IOPOLL',    usrCpu: 4,   sysCpu: 95 },
 ];
 
 /* ──────────────────────────────────────────────
@@ -86,10 +90,13 @@ export interface AdaptiveComparisonPoint {
   adaptiveC: number;     // MB/s (C 벤치마크 측정)
 }
 
+/* fioInterrupt / fioSqpoll은 fioCpuThroughput와 동일. adaptiveC는 측정 예정 placeholder.
+   adaptive 정책의 의의가 가장 잘 드러나는 곳은 100% 부하 — interrupt(1025)와
+   SQPOLL(564) 사이에서 어느 쪽으로 붙는지를 보고 싶은 구간이다. */
 export const adaptiveComparison: AdaptiveComparisonPoint[] = [
-  { cpuLoad: 'Idle',  fioInterrupt: 420, fioSqpoll: 580, adaptiveC: 560 },
-  { cpuLoad: '50%',   fioInterrupt: 400, fioSqpoll: 510, adaptiveC: 515 },
-  { cpuLoad: '100%',  fioInterrupt: 380, fioSqpoll: 340, adaptiveC: 405 },
+  { cpuLoad: 'Idle',  fioInterrupt: 1345, fioSqpoll: 1355, adaptiveC: 1340 },
+  { cpuLoad: '50%',   fioInterrupt: 1339, fioSqpoll: 1353, adaptiveC: 1340 },
+  { cpuLoad: '100%',  fioInterrupt: 1025, fioSqpoll: 564,  adaptiveC: 1000 },
 ];
 
 /** QD vs Latency — adaptive C vs fio modes */
@@ -100,12 +107,13 @@ export interface AdaptiveQdPoint {
   adaptiveC: number;     // μs
 }
 
+/* fioInterrupt / fioSqpoll은 fioQdLatency와 동일 측정값. adaptiveC는 측정 예정 placeholder. */
 export const adaptiveQdLatency: AdaptiveQdPoint[] = [
-  { qd: 1,   fioInterrupt: 95,  fioSqpoll: 78,  adaptiveC: 82 },
-  { qd: 4,   fioInterrupt: 102, fioSqpoll: 72,  adaptiveC: 75 },
-  { qd: 16,  fioInterrupt: 118, fioSqpoll: 70,  adaptiveC: 73 },
-  { qd: 64,  fioInterrupt: 145, fioSqpoll: 74,  adaptiveC: 76 },
-  { qd: 256, fioInterrupt: 210, fioSqpoll: 92,  adaptiveC: 96 },
+  { qd: 1,   fioInterrupt: 48,  fioSqpoll: 42,  adaptiveC: 45  },
+  { qd: 4,   fioInterrupt: 45,  fioSqpoll: 43,  adaptiveC: 44  },
+  { qd: 16,  fioInterrupt: 46,  fioSqpoll: 46,  adaptiveC: 46  },
+  { qd: 64,  fioInterrupt: 120, fioSqpoll: 120, adaptiveC: 120 },
+  { qd: 256, fioInterrupt: 476, fioSqpoll: 480, adaptiveC: 478 },
 ];
 
 /* ──────────────────────────────────────────────
