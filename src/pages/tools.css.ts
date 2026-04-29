@@ -14,6 +14,11 @@ export const hero = style({
   padding: `${vars.space[12]} ${vars.space[6]}`,
   background: `linear-gradient(135deg, ${vars.color.heroGradientFrom}, ${vars.color.heroGradientTo})`,
   color: '#ffffff',
+  '@media': {
+    '(max-width: 640px)': {
+      padding: `${vars.space[8]} ${vars.space[4]}`,
+    },
+  },
 });
 
 export const heroTitle = style({
@@ -22,6 +27,11 @@ export const heroTitle = style({
   color: '#ffffff',
   marginBottom: vars.space[3],
   letterSpacing: '-0.01em',
+  '@media': {
+    '(max-width: 640px)': {
+      fontSize: vars.fontSize['2xl'],
+    },
+  },
 });
 
 export const heroSubtitle = style({
@@ -29,12 +39,22 @@ export const heroSubtitle = style({
   color: 'rgba(255,255,255,0.85)',
   maxWidth: '640px',
   lineHeight: vars.lineHeight.relaxed,
+  '@media': {
+    '(max-width: 640px)': {
+      fontSize: vars.fontSize.sm,
+    },
+  },
 });
 
 export const content = style({
   maxWidth: vars.maxWidth.prose,
   margin: '0 auto',
   padding: `${vars.space[10]} ${vars.space[6]}`,
+  '@media': {
+    '(max-width: 640px)': {
+      padding: `${vars.space[6]} ${vars.space[4]}`,
+    },
+  },
 });
 
 export const sectionTitle = style({
@@ -42,6 +62,12 @@ export const sectionTitle = style({
   fontWeight: 700,
   color: vars.color.navy,
   marginBottom: vars.space[6],
+  '@media': {
+    '(max-width: 640px)': {
+      fontSize: vars.fontSize.xl,
+      marginBottom: vars.space[4],
+    },
+  },
 });
 
 export const tableWrapper = style({

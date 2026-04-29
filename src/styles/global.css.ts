@@ -19,6 +19,7 @@ globalStyle('body', {
   backgroundColor: vars.color.bg,
   WebkitFontSmoothing: 'antialiased',
   MozOsxFontSmoothing: 'grayscale',
+  overflowWrap: 'break-word',
 });
 
 /* Heading hierarchy matching reference site */
@@ -119,6 +120,18 @@ globalStyle('table', {
   marginTop: '0.8rem',
   marginBottom: '0.8rem',
   fontSize: '0.85rem',
+});
+
+/* On narrow screens, allow tables to scroll horizontally instead of overflowing the page */
+globalStyle('table', {
+  '@media': {
+    '(max-width: 640px)': {
+      display: 'block',
+      overflowX: 'auto',
+      WebkitOverflowScrolling: 'touch',
+      whiteSpace: 'nowrap',
+    },
+  },
 });
 
 globalStyle('thead th', {

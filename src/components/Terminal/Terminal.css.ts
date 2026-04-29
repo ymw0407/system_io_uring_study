@@ -34,6 +34,13 @@ export const body = style({
   fontSize: '0.8rem',
   lineHeight: '1.6',
   overflowX: 'auto',
+  WebkitOverflowScrolling: 'touch',
+  '@media': {
+    '(max-width: 640px)': {
+      padding: '0.6rem 0.8rem',
+      fontSize: '0.72rem',
+    },
+  },
 });
 
 export const commandLine = style({

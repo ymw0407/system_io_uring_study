@@ -8,6 +8,12 @@ export const section = style({
   marginBottom: '1.5rem',
   paddingLeft: vars.space[6],
   paddingRight: vars.space[6],
+  '@media': {
+    '(max-width: 640px)': {
+      paddingLeft: vars.space[4],
+      paddingRight: vars.space[4],
+    },
+  },
 });
 
 export const card = style({
@@ -15,6 +21,11 @@ export const card = style({
   border: `1px solid ${vars.color.border}`,
   borderRadius: '8px',
   padding: '1.5rem 2rem',
+  '@media': {
+    '(max-width: 640px)': {
+      padding: '1.1rem 1.1rem',
+    },
+  },
 });
 
 export const sectionTitle = style({
@@ -24,6 +35,11 @@ export const sectionTitle = style({
   marginBottom: '0.8rem',
   paddingBottom: '0.5rem',
   borderBottom: `2px solid ${vars.color.badge}`,
+  '@media': {
+    '(max-width: 640px)': {
+      fontSize: '1.15rem',
+    },
+  },
 });
 
 export const sectionBody = style({

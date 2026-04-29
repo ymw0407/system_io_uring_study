@@ -8,6 +8,11 @@ export const wrapper = style({
   backgroundColor: vars.color.surface,
   borderRadius: '8px',
   border: `1px solid ${vars.color.border}`,
+  '@media': {
+    '(max-width: 640px)': {
+      padding: '0.9rem 0.6rem',
+    },
+  },
 });
 
 export const caption = style({

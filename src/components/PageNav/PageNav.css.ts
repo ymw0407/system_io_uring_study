@@ -9,6 +9,12 @@ export const wrapper = style({
   marginLeft: 'auto',
   marginRight: 'auto',
   padding: `2rem ${vars.space[6]} 0`,
+  '@media': {
+    '(max-width: 640px)': {
+      padding: `1.5rem ${vars.space[4]} 0`,
+      gap: '0.6rem',
+    },
+  },
 });
 
 export const navLink = style({
@@ -22,11 +28,18 @@ export const navLink = style({
   textDecoration: 'none',
   color: 'inherit',
   transition: 'box-shadow 0.2s, border-color 0.2s',
+  minWidth: 0,
   selectors: {
     '&:hover': {
       boxShadow: '0 2px 8px rgba(0,51,102,0.06)',
       borderColor: '#c5d1e0',
       textDecoration: 'none',
+    },
+  },
+  '@media': {
+    '(max-width: 640px)': {
+      padding: '0.6rem 0.9rem',
+      flex: 1,
     },
   },
 });

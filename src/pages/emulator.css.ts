@@ -5,10 +5,20 @@ export const page = style({
   maxWidth: '1000px',
   margin: '0 auto',
   padding: `${vars.space[10]} ${vars.space[6]} ${vars.space[16]}`,
+  '@media': {
+    '(max-width: 640px)': {
+      padding: `${vars.space[6]} ${vars.space[4]} ${vars.space[10]}`,
+    },
+  },
 });
 
 export const header = style({
   marginBottom: vars.space[8],
+  '@media': {
+    '(max-width: 640px)': {
+      marginBottom: vars.space[5],
+    },
+  },
 });
 
 export const title = style({
@@ -16,6 +26,11 @@ export const title = style({
   fontWeight: 700,
   color: vars.color.navy,
   marginBottom: vars.space[2],
+  '@media': {
+    '(max-width: 640px)': {
+      fontSize: vars.fontSize['2xl'],
+    },
+  },
 });
 
 export const subtitle = style({

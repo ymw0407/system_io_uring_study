@@ -6,6 +6,11 @@ export const nav = style({
   marginLeft: 'auto',
   marginRight: 'auto',
   padding: `1rem ${vars.space[6]} 0`,
+  '@media': {
+    '(max-width: 640px)': {
+      padding: `0.75rem ${vars.space[4]} 0`,
+    },
+  },
 });
 
 export const list = style({
@@ -17,6 +22,11 @@ export const list = style({
   backgroundColor: vars.color.surface,
   borderRadius: '8px',
   border: `1px solid ${vars.color.border}`,
+  '@media': {
+    '(max-width: 640px)': {
+      padding: '1rem 1rem',
+    },
+  },
 });
 
 export const item = style({
@@ -48,4 +58,9 @@ export const tocTitle = style({
   letterSpacing: '0.05em',
   marginBottom: '0.4rem',
   paddingLeft: '1.5rem',
+  '@media': {
+    '(max-width: 640px)': {
+      paddingLeft: '1rem',
+    },
+  },
 });

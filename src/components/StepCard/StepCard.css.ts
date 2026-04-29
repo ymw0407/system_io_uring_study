@@ -7,6 +7,11 @@ export const stepItem = style({
   gap: '1.2rem',
   position: 'relative',
   marginBottom: vars.space[4],
+  '@media': {
+    '(max-width: 640px)': {
+      gap: '0.8rem',
+    },
+  },
 });
 
 export const stepNumberCol = style({
@@ -15,6 +20,11 @@ export const stepNumberCol = style({
   alignItems: 'center',
   flexShrink: 0,
   width: '44px',
+  '@media': {
+    '(max-width: 640px)': {
+      width: '36px',
+    },
+  },
 });
 
 export const stepBadge = recipe({
@@ -29,6 +39,13 @@ export const stepBadge = recipe({
     fontSize: '1rem',
     color: '#ffffff',
     flexShrink: 0,
+    '@media': {
+      '(max-width: 640px)': {
+        width: '36px',
+        height: '36px',
+        fontSize: '0.9rem',
+      },
+    },
   },
   variants: {
     kind: {
@@ -49,6 +66,7 @@ export const connector = style({
 
 export const card = style({
   flex: 1,
+  minWidth: 0,
   backgroundColor: vars.color.surface,
   border: `1px solid ${vars.color.border}`,
   borderRadius: vars.radius.md,
@@ -58,6 +76,11 @@ export const card = style({
     '&:hover': {
       boxShadow: '0 4px 12px rgba(0,51,102,0.08)',
       borderColor: '#c5d1e0',
+    },
+  },
+  '@media': {
+    '(max-width: 640px)': {
+      padding: '0.9rem 1rem',
     },
   },
 });

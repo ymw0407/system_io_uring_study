@@ -10,6 +10,11 @@ export const hero = style({
   padding: `${vars.space[16]} ${vars.space[6]}`,
   background: `linear-gradient(135deg, ${vars.color.heroGradientFrom}, ${vars.color.heroGradientTo})`,
   color: '#ffffff',
+  '@media': {
+    '(max-width: 640px)': {
+      padding: `${vars.space[10]} ${vars.space[4]}`,
+    },
+  },
 });
 
 export const title = style({
@@ -18,6 +23,11 @@ export const title = style({
   color: '#ffffff',
   marginBottom: vars.space[3],
   letterSpacing: '-0.01em',
+  '@media': {
+    '(max-width: 640px)': {
+      fontSize: '1.4rem',
+    },
+  },
 });
 
 export const subtitle = style({
@@ -26,6 +36,12 @@ export const subtitle = style({
   maxWidth: '640px',
   lineHeight: vars.lineHeight.relaxed,
   marginBottom: vars.space[6],
+  '@media': {
+    '(max-width: 640px)': {
+      fontSize: '0.875rem',
+      marginBottom: vars.space[4],
+    },
+  },
 });
 
 export const meta = style({

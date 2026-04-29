@@ -6,6 +6,11 @@ export const wrapper = style({
   marginLeft: 'auto',
   marginRight: 'auto',
   padding: `${vars.space[8]} ${vars.space[6]}`,
+  '@media': {
+    '(max-width: 640px)': {
+      padding: `${vars.space[6]} ${vars.space[4]}`,
+    },
+  },
 });
 
 export const heading = style({
