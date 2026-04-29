@@ -13,17 +13,17 @@
 export type IoMode = 'interrupt' | 'polling' | 'adaptive';
 
 /* ──────────────────────────────────────────────
- * Round 1: C 벤치마크 (교육용, 대략적 측정)
+ * Round 1: C 벤치마크 (QD=1, 4KB 랜덤 읽기 100회 × 13~14회 반복의 median)
  * ────────────────────────────────────────────── */
 
 export interface Round1Point {
   label: string;
-  latency: number; // μs, rough clock_gettime measurement
+  latency: number; // μs, median of avg-per-run (clock_gettime)
 }
 
 export const round1Results: Round1Point[] = [
-  { label: 'POSIX read()', latency: 110 },
-  { label: 'io_uring interrupt', latency: 92 },
+  { label: 'POSIX read()', latency: 122.6 },
+  { label: 'io_uring interrupt', latency: 125.9 },
 ];
 
 /* ──────────────────────────────────────────────
