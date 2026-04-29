@@ -132,7 +132,7 @@ Ubuntu 설치:
   -drive file=ubuntu.qcow2,if=virtio,format=qcow2 \\
   -cdrom ubuntu-22.04-server-amd64.iso \\
   -boot d \\
-  -net nic -net user,hostfwd=tcp::2222-:22`}
+  -netdev user,id=net0,hostfwd=tcp::2222-:22 -device virtio-net-pci,netdev=net0`}
 </CodeBlock>
 
 설치 완료 후 NVMe 포함 기동:
@@ -145,7 +145,7 @@ Ubuntu 설치:
   -drive file=nvme_disk.raw,id=nvm,if=none,format=raw \\
   -device nvme,id=nvme0,serial=deadbeef \\
   -device nvme-ns,drive=nvm,bus=nvme0,nsid=1,logical_block_size=512,physical_block_size=512 \\
-  -net nic -net user,hostfwd=tcp::2222-:22 \\
+  -netdev user,id=net0,hostfwd=tcp::2222-:22 -device virtio-net-pci,netdev=net0 \\
   -nographic`}
 </CodeBlock>
 
@@ -270,7 +270,7 @@ qemu-system-x86_64 \`
   -drive file=ubuntu.qcow2,if=virtio,format=qcow2 \`
   -cdrom ubuntu-22.04-server-amd64.iso \`
   -boot d \`
-  -net nic -net user,hostfwd=tcp::2222-:22`}
+  -netdev user,id=net0,hostfwd=tcp::2222-:22 -device virtio-net-pci,netdev=net0`}
 </CodeBlock>
 
 PowerShell 줄바꿈은 백틱(`` ` ``), CMD에서는 `^`다.
@@ -287,7 +287,7 @@ qemu-system-x86_64 \`
   -drive file=nvme_disk.raw,id=nvm,if=none,format=raw \`
   -device nvme,id=nvme0,serial=deadbeef \`
   -device nvme-ns,drive=nvm,bus=nvme0,nsid=1,logical_block_size=512,physical_block_size=512 \`
-  -net nic -net user,hostfwd=tcp::2222-:22 \`
+  -netdev user,id=net0,hostfwd=tcp::2222-:22 -device virtio-net-pci,netdev=net0 \`
   -nographic`}
 </CodeBlock>
 
@@ -351,8 +351,11 @@ NVMe는 세 줄로 분리해서 정의한다.
 
 **네트워크 (공통)**
 
-- `-net nic -net user,hostfwd=tcp::2222-:22` — user-mode 네트워킹 + 포트 포워딩.
-  - `hostfwd=tcp::2222-:22` — 호스트의 2222 포트를 게스트의 22(SSH)로 연결.
+- `-netdev user,id=net0,hostfwd=tcp::2222-:22` — user-mode 네트워크 백엔드(NAT). 게스트가 호스트 인터넷을 빌려 쓴다.
+- `-device virtio-net-pci,netdev=net0` — virtio-net 가상 NIC를 위 백엔드에 연결. Ubuntu 커널에 virtio 드라이버가 기본 포함이라 즉시 인식한다.
+- `hostfwd=tcp::2222-:22` — 호스트의 2222 포트를 게스트의 22(SSH)로 연결.
+
+레거시 `-net nic -net user,...`로도 동작하지만, 게스트가 e1000으로 부팅돼 `Wait for Network to be Configured`에서 30~120초 멈추는 사례가 많다. 위 `-netdev + virtio-net-pci` 형태가 안정적이다.
 
 **디스플레이 (공통)**
 
@@ -436,7 +439,7 @@ qemu-system-x86_64 \\
   -drive file=nvme_disk.raw,id=nvm,if=none,format=raw \\
   -device nvme,id=nvme0,serial=deadbeef \\
   -device nvme-ns,drive=nvm,bus=nvme0,nsid=1,logical_block_size=512,physical_block_size=512 \\
-  -net nic -net user,hostfwd=tcp::2222-:22 \\
+  -netdev user,id=net0,hostfwd=tcp::2222-:22 -device virtio-net-pci,netdev=net0 \\
   -nographic "$@"`}
 </CodeBlock>
 
@@ -455,7 +458,7 @@ qemu-system-x86_64 \`
   -drive "file=$QEMU_LAB\\nvme_disk.raw,id=nvm,if=none,format=raw" \`
   -device nvme,id=nvme0,serial=deadbeef \`
   -device nvme-ns,drive=nvm,bus=nvme0,nsid=1,logical_block_size=512,physical_block_size=512 \`
-  -net nic -net user,hostfwd=tcp::2222-:22 \`
+  -netdev user,id=net0,hostfwd=tcp::2222-:22 -device virtio-net-pci,netdev=net0 \`
   -nographic`}
 </CodeBlock>
 
@@ -480,6 +483,7 @@ qemu-system-x86_64 \`
 | PuTTY `Connection timed out` | 포트 포워딩 오류 | QEMU에서 `hostfwd=tcp::2222-:22` 확인, Windows 방화벽 확인 |
 | ISO 부팅 실패 | `-boot d` 누락 | 설치 명령에 `-boot d` 포함 확인 |
 | SSH `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED` | 이전 VM의 호스트 키와 충돌 | `ssh-keygen -R "[localhost]:2222"` |
+| 부팅 시 `Wait for Network to be Configured` 30~120초 정지 / 게스트에서 `apt install`이 DNS 오류로 실패 | 레거시 `-net nic`로 e1000 NIC을 받았는데 netplan이 인터페이스를 못 잡음 | (1) QEMU 명령을 위 `-netdev user,id=net0,... -device virtio-net-pci,netdev=net0` 형태로 교체. (2) 이미 설치된 VM이라면 게스트에서 `ip a`로 인터페이스 이름 확인 → `/etc/netplan/00-installer-config.yaml`에서 인터페이스 이름을 실제 이름으로 수정 → `sudo netplan apply`. (3) 부팅 대기를 단축하려면 `sudo systemctl disable systemd-networkd-wait-online.service` |
 
 <Callout kind="checkpoint">
 **준비 완료 체크리스트 (Windows)**
