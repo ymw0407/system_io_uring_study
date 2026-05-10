@@ -117,6 +117,47 @@ export const adaptiveQdLatency: AdaptiveQdPoint[] = [
 ];
 
 /* ──────────────────────────────────────────────
+ * Round 3.5: 패치된 fio --adaptive_mode (Phase 3, in-process self-switching)
+ * 단일 fio 실행 안에서 SQPOLL ↔ interrupt를 신호 기반으로 토글.
+ * source: bench_all_baremetal.sh Phase 3 stderr + write_bw_log
+ * ────────────────────────────────────────────── */
+
+/** 모드 전환 타임라인 (stderr "io_uring: adaptive switch -> X at t=N ms"에서 파싱) */
+export interface AdaptiveTimelinePoint {
+  tMs: number;
+  mode: 'polling' | 'interrupt';
+}
+
+/* 예시 데이터: stress-ng가 30s에서 켜졌다가 60s에서 꺼지는 시나리오. */
+export const adaptiveTimeline: AdaptiveTimelinePoint[] = [
+  { tMs: 0,     mode: 'polling' },
+  { tMs: 31200, mode: 'interrupt' },
+  { tMs: 60800, mode: 'polling' },
+];
+
+/** 어댑티브 실행 중 100ms 버킷별 대역폭 (write_bw_log에서 파싱) */
+export interface AdaptiveBandwidthPoint {
+  tMs: number;
+  mbps: number;
+}
+
+/* 예시 데이터: 90s 실행, 30~60s 구간만 interrupt 모드(처리량 ↓). */
+export const adaptiveBandwidth: AdaptiveBandwidthPoint[] = [
+  { tMs: 0,     mbps: 1352 },
+  { tMs: 10000, mbps: 1349 },
+  { tMs: 20000, mbps: 1351 },
+  { tMs: 30000, mbps: 1350 },
+  { tMs: 31300, mbps: 0    }, // ring rebuild pause (drain + setup ~수 ms)
+  { tMs: 32000, mbps: 1024 },
+  { tMs: 45000, mbps: 1010 },
+  { tMs: 60000, mbps: 1015 },
+  { tMs: 60900, mbps: 0    },
+  { tMs: 62000, mbps: 1348 },
+  { tMs: 80000, mbps: 1352 },
+  { tMs: 90000, mbps: 1351 },
+];
+
+/* ──────────────────────────────────────────────
  * Summary table (Round 3 결과 종합)
  * ────────────────────────────────────────────── */
 
