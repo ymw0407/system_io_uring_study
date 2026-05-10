@@ -2,6 +2,7 @@ import type { AdaptiveParams, TracePreset } from '../../simulation/types';
 import * as s from './SimControls.css';
 
 const PRESET_LABELS: Record<TracePreset, string> = {
+  'bench-cycling': 'Bench cycling (mirrors scripts/bench_compare.sh)',
   constant: 'Constant (steady load)',
   step: 'Step (CPU spike mid-run)',
   ramp: 'Ramp (linear CPU climb)',

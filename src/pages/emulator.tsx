@@ -7,14 +7,16 @@ import { SimStepLog } from '../components/SimStepLog/SimStepLog';
 import { SimRuleBox } from '../components/SimRuleBox/SimRuleBox';
 import { generateTrace } from '../simulation/traces';
 import { runEmulation } from '../simulation/emulator';
-import { DEFAULT_PARAMS } from '../simulation/types';
+import { DEFAULT_PARAMS, BENCH_CYCLING_DEFAULT_LENGTH } from '../simulation/types';
 import type { AdaptiveParams, TracePreset, SimResult } from '../simulation/types';
 import * as s from './emulator.css';
 
 export default function Emulator() {
+  // Defaults match the patched fio's --adaptive_mode and scripts/bench_compare.sh
+  // so the emulator visualizes the actual test the user is running on bare metal.
   const [params, setParams] = useState<AdaptiveParams>(DEFAULT_PARAMS);
-  const [tracePreset, setTracePreset] = useState<TracePreset>('step');
-  const [traceLength, setTraceLength] = useState(500);
+  const [tracePreset, setTracePreset] = useState<TracePreset>('bench-cycling');
+  const [traceLength, setTraceLength] = useState(BENCH_CYCLING_DEFAULT_LENGTH);
   const [result, setResult] = useState<SimResult | null>(null);
   const [position, setPosition] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -73,7 +75,9 @@ export default function Emulator() {
       <header className={s.header}>
         <h1 className={s.title}>Adaptive I/O Emulator</h1>
         <p className={s.subtitle}>
-          피드백 루프 포함 — 모드 선택이 CPU 사용률과 latency에 영향을 미친다
+          피드백 루프 포함 — 모드 선택이 CPU 사용률과 latency에 영향을 미친다.
+          기본 트레이스는 <code>scripts/bench_compare.sh</code>의 cycling 시나리오를 그대로 따라가며
+          (60초, t=15s/40s에 stress 두 번), 패치된 fio의 <code>--adaptive_mode</code> 기본값과 같은 임계치를 쓴다.
         </p>
       </header>
 

@@ -1,4 +1,5 @@
 import type { TracePoint, TracePreset } from './types';
+import { BENCH_CYCLING_STEP_MS } from './types';
 
 /** Generate a trace of (deviceLatency, bgCpu) pairs */
 export function generateTrace(preset: TracePreset, length: number): TracePoint[] {
@@ -13,6 +14,8 @@ export function generateTrace(preset: TracePreset, length: number): TracePoint[]
       return noisyTrace(length);
     case 'burst':
       return burstTrace(length);
+    case 'bench-cycling':
+      return benchCyclingTrace(length);
     case 'custom':
       return constantTrace(length);
   }
@@ -61,6 +64,43 @@ function burstTrace(n: number): TracePoint[] {
     return {
       deviceLatency: 80 + Math.random() * 20,
       bgCpu: inBurst ? 80 + Math.random() * 15 : 25 + Math.random() * 10,
+    };
+  });
+}
+
+/**
+ * Mirrors scripts/bench_compare.sh — the actual stress test running on
+ * bare metal. Each trace step ≈ 100 ms (BENCH_CYCLING_STEP_MS), so the
+ * default 600-step trace covers 60 s.
+ *
+ * Schedule (matches bench_compare.sh defaults):
+ *   t=0..15s     idle           bgCpu ≈ 25%
+ *   t=15..25s    stress-ng      bgCpu ≈ 100%
+ *   t=25..40s    idle           bgCpu ≈ 25%
+ *   t=40..50s    stress-ng      bgCpu ≈ 100%
+ *   t=50..end    idle           bgCpu ≈ 25%
+ *
+ * deviceLatency stays low (~85μs, NVMe randread baseline) — the cycling
+ * lives in the bgCpu signal, which is exactly what the patched fio's
+ * adaptive_mode reads from /proc/stat.
+ */
+function benchCyclingTrace(n: number): TracePoint[] {
+  // Schedule in milliseconds, then convert to step indices.
+  const LOAD1_START_MS = 15_000;
+  const LOAD1_END_MS = 25_000;
+  const LOAD2_START_MS = 40_000;
+  const LOAD2_END_MS = 50_000;
+
+  return Array.from({ length: n }, (_, i) => {
+    const tMs = i * BENCH_CYCLING_STEP_MS;
+    const inLoad1 = tMs >= LOAD1_START_MS && tMs < LOAD1_END_MS;
+    const inLoad2 = tMs >= LOAD2_START_MS && tMs < LOAD2_END_MS;
+    const inStress = inLoad1 || inLoad2;
+    return {
+      deviceLatency: 85 + Math.random() * 10,
+      bgCpu: inStress
+        ? 95 + Math.random() * 4   // stress-ng pegs all cores ~100%
+        : 22 + Math.random() * 8,  // idle multi-core baseline
     };
   });
 }

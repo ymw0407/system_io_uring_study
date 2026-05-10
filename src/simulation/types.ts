@@ -57,4 +57,16 @@ export type TracePreset =
   | 'ramp'
   | 'noisy'
   | 'burst'
+  | 'bench-cycling'
   | 'custom';
+
+/**
+ * Mapping for the bench-cycling preset:
+ * - 1 trace step ≈ 100 ms of wall clock time
+ * - Total 600 steps = 60 s, mirroring scripts/bench_compare.sh defaults
+ *
+ * If you change BENCH_CYCLING_STEP_MS, also update the defaults in
+ * src/simulation/traces.ts and the preset description in SimControls.
+ */
+export const BENCH_CYCLING_STEP_MS = 100;
+export const BENCH_CYCLING_DEFAULT_LENGTH = 600;
