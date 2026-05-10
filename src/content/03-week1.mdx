@@ -326,14 +326,157 @@ QD=1 환경에서는 두 방식의 평균 지연이 거의 구분되지 않는�
 QD를 높여 여러 요청을 한 번에 깔아 두는 시점부터 두 방식의 곡선이 갈라지는데, 이것은 다음 실습에서 fio로 직접 측정한다.
 </Callout>
 
+## 여러 요청을 한 번에 제출하기
+
+앞 절의 `uring_read.c`는 형식만 io_uring일 뿐 흐름은 동기 `read()`와 같다. 큐 크기를 1로 두고 매 반복마다 SQE 하나를 올린 뒤 그 완료를 기다려 다음 SQE를 올리기 때문이다. 한 시점에 in-flight 상태인 요청은 항상 0개 또는 1개라, POSIX `read()`와 평균 지연이 같게 나오는 게 자연스럽다.
+
+io_uring 본래의 형태는 다르다. SQE를 큐에 *여러 개* 쌓아 두고 `io_uring_submit()`을 한 번 호출하면, 커널은 그 모두를 한 번에 디바이스로 내려보낸다. 100개의 4KB 랜덤 읽기를 한꺼번에 던지면 NVMe는 그 요청들을 자신의 내부 큐에서 병렬로 처리하고, 100번 분의 컨텍스트 스위치도 한 묶음으로 상각된다. 이번 절에서는 앞의 코드를 이 형태로 바꾼다.
+
+기존 코드를 다음 세 군데에서 고친다.
+
+1. `io_uring_queue_init`의 큐 크기를 1에서 `COUNT`로 늘려, 100개의 SQE가 동시에 들어갈 자리를 만든다
+2. 요청마다 별도의 정렬된 버퍼를 둔다. 같은 버퍼를 100개 read가 공유하면 모두가 같은 메모리 위치에 쓰는 데이터 레이스가 된다
+3. 모든 SQE를 채운 뒤 `io_uring_submit()`을 한 번만 호출하고, 그 다음 `io_uring_wait_cqe()`를 `submitted` 횟수만큼 돌려 CQE를 회수한다. 완료 순서는 제출 순서와 같다고 보장되지 않으므로, `io_uring_sqe_set_data()`로 요청 인덱스를 SQE에 심어 두고 CQE에서 다시 꺼낸다
+
+<CodeBlock language="c" filename="uring_read_async.c">
+{`#define _GNU_SOURCE
+#include <liburing.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define BS    4096
+#define COUNT 100
+
+static double timespec_diff_us(struct timespec *a,
+                               struct timespec *b)
+{
+    return (b->tv_sec - a->tv_sec) * 1e6
+         + (b->tv_nsec - a->tv_nsec) / 1e3;
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <file>\\n", argv[0]);
+        return 1;
+    }
+
+    int fd = open(argv[1], O_RDONLY | O_DIRECT);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+
+    /* the queue must hold all COUNT requests at once */
+    struct io_uring ring;
+    if (io_uring_queue_init(COUNT, &ring, 0) < 0) {
+        perror("io_uring_queue_init");
+        close(fd);
+        return 1;
+    }
+
+    /* one aligned buffer per request; sharing a single buffer
+       would let every read race for the same memory */
+    void *bufs[COUNT];
+    for (int i = 0; i < COUNT; i++) {
+        if (posix_memalign(&bufs[i], BS, BS) != 0) {
+            perror("posix_memalign");
+            for (int j = 0; j < i; j++) free(bufs[j]);
+            io_uring_queue_exit(&ring);
+            close(fd);
+            return 1;
+        }
+    }
+
+    srand(0);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    /* phase 1: stage COUNT SQEs without submitting yet */
+    for (int i = 0; i < COUNT; i++) {
+        off_t off = (rand() % 8192) * (off_t)BS;
+
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+        if (sqe == NULL) {
+            fprintf(stderr, "io_uring_get_sqe failed\\n");
+            break;
+        }
+        io_uring_prep_read(sqe, fd, bufs[i], BS, off);
+
+        /* tag the SQE so the CQE can be matched back;
+           completions may arrive in any order */
+        io_uring_sqe_set_data(sqe, (void *)(long)i);
+    }
+
+    /* phase 2: hand the whole batch to the kernel in one call */
+    int submitted = io_uring_submit(&ring);
+    if (submitted < 0) {
+        fprintf(stderr, "io_uring_submit: %s\\n",
+                strerror(-submitted));
+        goto cleanup;
+    }
+
+    /* phase 3: drain completions */
+    for (int i = 0; i < submitted; i++) {
+        struct io_uring_cqe *cqe;
+        if (io_uring_wait_cqe(&ring, &cqe) < 0) {
+            perror("io_uring_wait_cqe");
+            break;
+        }
+
+        int req_id = (int)(long)io_uring_cqe_get_data(cqe);
+        if (cqe->res < 0) {
+            fprintf(stderr, "read error: req=%d, %s\\n",
+                    req_id, strerror(-cqe->res));
+            io_uring_cqe_seen(&ring, cqe);
+            break;
+        }
+        if (cqe->res != BS) {
+            fprintf(stderr, "short read: req=%d, res=%d\\n",
+                    req_id, cqe->res);
+        }
+        io_uring_cqe_seen(&ring, cqe);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double total_us = timespec_diff_us(&t0, &t1);
+    printf("count=%d, submitted=%d, "
+           "total=%.1f us, avg=%.1f us/op\\n",
+           COUNT, submitted, total_us, total_us / submitted);
+
+cleanup:
+    for (int i = 0; i < COUNT; i++) free(bufs[i]);
+    io_uring_queue_exit(&ring);
+    close(fd);
+    return 0;
+}`}
+</CodeBlock>
+
+빌드와 실행은 동일하다.
+
+<Terminal title="배칭 버전 빌드 및 실행" commands={[
+  { cmd: "gcc -O2 -o uring_read_async uring_read_async.c -luring" },
+  { cmd: "./uring_read_async /tmp/testfile", output: ["count=100, submitted=100, total=4552.1 us, avg=45.5 us/op"] }
+]} />
+
+QD=1 버전이 op당 약 125μs였던 것이 batched 버전에서는 op당 약 45μs로 떨어진다. 단일 요청의 디바이스 지연이 줄어든 것이 아니다. 100개 요청의 디바이스 시간이 서로 겹쳐 있기 때문에 *벽시계 기준 평균*만 작아 보이는 것이다. 한 요청을 끝까지 기다린 뒤 다음을 보내는 직렬 파이프라인이, 100개를 한꺼번에 흘려 그중 가장 느린 것의 완료까지 기다리는 병렬 파이프라인으로 바뀌면서, 같은 100회 작업의 총 벽시계 시간이 약 12.5ms에서 약 4.6ms로 줄었다.
+
+이 차이가 io_uring이 가져오는 것의 본질이다. 같은 디바이스, 같은 syscall API임에도 *몇 개를 동시에 in-flight 상태로 두느냐*에 따라 처리량이 달라진다. 다음 회차에서는 이 in-flight 수(QD)를 1, 4, 16, 64, 256으로 변화시키며 interrupt/SQPOLL/IOPOLL 세 모드의 차이까지 한꺼번에 측정한다.
+
 ## 여기까지 이해한 것
 
-이번 실습에서 직접 확인한 것은 세 가지다.
+이번 실습에서 직접 확인한 것은 네 가지다.
 첫째, io_uring의 SQ/CQ 흐름을 C 코드로 구현하고 실제로 파일을 읽었다.
 둘째, `get_sqe`, `prep_read`, `submit`, `wait_cqe`, `cqe_seen` 다섯 단계가 io_uring의 기본 사이클이라는 것을 코드로 확인했다.
-셋째, QD=1 단발 호출 환경에서는 POSIX `read()`와 io_uring의 평균 지연이 거의 같다는 것을 직접 측정했다. io_uring의 이점은 이 구간에서 드러나지 않는다.
+셋째, QD=1 단발 호출 환경에서는 POSIX `read()`와 io_uring의 평균 지연이 거의 같다. io_uring의 이점은 이 구간에서 드러나지 않는다.
+넷째, 같은 코드를 100개 SQE를 한 번에 제출하는 형태로 바꾸자 op당 체감 지연이 약 125μs에서 약 45μs로, 100회 작업의 총 시간이 약 12.5ms에서 약 4.6ms로 줄었다. io_uring의 진짜 강점은 배칭으로 in-flight 요청 수를 늘리는 데서 나온다.
 
-아직 QD를 1로 고정했기 때문에 io_uring의 진짜 강점인 배칭과 비동기 처리는 활용하지 못했다.
-다음 회차에서는 fio를 사용하여 QD, SQPOLL, CPU 부하를 변수로 두고 정밀하게 측정한다.
+여기까지는 C로 직접 짠 단순한 벤치마크다.
+다음 회차에서는 fio를 사용하여 QD, SQPOLL, CPU 부하를 변수로 두고 같은 비교를 정밀하게 다시 한다.
 
 </Section>
