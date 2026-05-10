@@ -1,7 +1,11 @@
 #!/bin/bash
 # bench_all_baremetal.sh — Part 3 chart data on bare-metal Linux (Arch)
-# Measures: fioQdLatency (mode × QD), fioCpuUsage (QD=16), fioCpuThroughput (CPU load × {interrupt, sqpoll}).
+# Measures: fioQdLatency (mode × QD), fioCpuUsage (QD=16), fioCpuThroughput (CPU load × {interrupt, sqpoll}),
+#           adaptiveTimeline + adaptiveBandwidth (Week 3 self-switching, requires patched fio).
 # Output: results-baremetal/*.json + TS-ready blocks at the end (paste back to update experiments.ts).
+#
+# The adaptive phase requires the fio fork with the --adaptive_mode option
+# (engines/io_uring.c). Without it, Phase 3 will fail with "unknown option".
 #
 # usage:
 #   sudo bash bench_all_baremetal.sh                              # file-based, 1 GB random in /tmp
@@ -60,8 +64,10 @@ if command -v cpupower >/dev/null; then
 fi
 
 mkdir -p "$OUTDIR"
-TOTAL=$((15 + 6))
-echo "Will run $TOTAL fio jobs × ${RUNTIME}s ≈ $((TOTAL*RUNTIME/60))min"
+TOTAL=$((15 + 6 + 1))
+# Phase 3 (adaptive) runs for 3*RUNTIME; account for it separately.
+TOTAL_SECS=$(( (15 + 6) * RUNTIME + 3 * RUNTIME ))
+echo "Will run $TOTAL fio jobs ≈ $((TOTAL_SECS / 60))min"
 echo
 
 # --- Phase 1: mode × QD (15 runs) ---
@@ -121,7 +127,41 @@ run_cpu_load "idle" 0
 run_cpu_load "50"   "$HALF"
 run_cpu_load "100"  "$CORES"
 
-# --- Phase 3: parse → TS-ready blocks ---
+# --- Phase 3: adaptive (1 run, ~3× RUNTIME, requires patched fio) ---
+# Verifies the fio --adaptive_mode option: starts in SQPOLL, drops to interrupt
+# when stress-ng pushes CPU above the threshold, returns to SQPOLL afterward.
+# The patched fio prints "io_uring: adaptive switch -> {polling,interrupt} at t=…"
+# to stderr; we capture it as the timeline.
+echo
+echo "==== Phase 3: adaptive ===="
+ADAPT_RUNTIME=$((RUNTIME * 3))
+ADAPT_LOG="$OUTDIR/adaptive.stderr"
+ADAPT_BWPREFIX="$OUTDIR/adaptive_bw"
+echo 3 > /proc/sys/vm/drop_caches
+
+# spawn cycling CPU pressure: idle, then load, then idle (one full cycle)
+(
+  sleep $((ADAPT_RUNTIME / 4))
+  stress-ng --cpu "$CORES" --timeout $((ADAPT_RUNTIME / 2))s >/dev/null 2>&1
+) &
+ADAPT_STRESS_PID=$!
+
+echo ">>> adaptive: ${ADAPT_RUNTIME}s, CPU stress for the middle half"
+fio --name="adaptive" \
+    --ioengine=io_uring \
+    --rw=randread --bs=4k --direct=1 \
+    --iodepth=64 \
+    --filename="$TESTFILE" \
+    --runtime="$ADAPT_RUNTIME" --time_based \
+    --output-format=json \
+    --output="$OUTDIR/adaptive.json" \
+    --write_bw_log="$ADAPT_BWPREFIX" --log_avg_msec=100 \
+    --adaptive_mode="cpu_hi=70:qd_lo=8:cooldown_ms=500" \
+    2> >(tee "$ADAPT_LOG" >&2) >/dev/null
+
+wait "$ADAPT_STRESS_PID" 2>/dev/null
+
+# --- Phase 4: parse → TS-ready blocks ---
 echo
 echo "============================================================"
 echo "  PASTE EVERYTHING BELOW BACK TO CLAUDE"
@@ -157,4 +197,22 @@ for pair in "Idle:idle" "50%:50" "100%:100"; do
 done
 
 echo
-echo "Done. JSON in $OUTDIR/"
+echo "// ---- adaptiveTimeline (mode transitions, t in ms) ----"
+echo "// stderr lines from patched fio: 'io_uring: adaptive switch -> <mode> at t=N ms ...'"
+if [ -f "$ADAPT_LOG" ]; then
+  # Always start in polling; stamp transitions from the log.
+  echo "  { tMs: 0, mode: 'polling' },"
+  grep -E "adaptive switch -> (polling|interrupt) at t=" "$ADAPT_LOG" | \
+    sed -E "s/.*adaptive switch -> ([a-z]+) at t=([0-9]+) ms.*/  { tMs: \2, mode: '\1' },/"
+fi
+
+echo
+echo "// ---- adaptiveBandwidth (MB/s, 100ms buckets) ----"
+echo "// from $ADAPT_BWPREFIX_bw.*.log: csv 'time_ms,bw_KiBps,ddir,bs,prio'"
+ADAPT_BW_FILE=$(ls "${ADAPT_BWPREFIX}"_bw.*.log 2>/dev/null | head -1)
+if [ -n "$ADAPT_BW_FILE" ]; then
+  awk -F', *' 'NR>0 { printf "  { tMs: %d, mbps: %.1f },\n", $1, $2/1024 }' "$ADAPT_BW_FILE" | head -200
+fi
+
+echo
+echo "Done. JSON in $OUTDIR/, adaptive stderr in $ADAPT_LOG"
