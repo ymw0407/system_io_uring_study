@@ -1,11 +1,13 @@
 import { mdxComponents, type MdxComponent } from '../mdxComponents';
 import { PageNav } from '../components/PageNav/PageNav';
 
+import Tradeoffs from '../content/05a-tradeoffs.mdx';
 import Week3 from '../content/05-week3.mdx';
 import Adaptive from '../content/06-adaptive.mdx';
 import Result from '../content/07-result.mdx';
 import Conclusion from '../content/08-conclusion.mdx';
 
+const MdxTradeoffs = Tradeoffs as MdxComponent;
 const MdxWeek3 = Week3 as MdxComponent;
 const MdxAdaptive = Adaptive as MdxComponent;
 const MdxResult = Result as MdxComponent;
@@ -14,6 +16,7 @@ const MdxConclusion = Conclusion as MdxComponent;
 export default function Part4() {
   return (
     <>
+      <MdxTradeoffs components={mdxComponents} />
       <MdxWeek3 components={mdxComponents} />
       <MdxAdaptive components={mdxComponents} />
       <MdxResult components={mdxComponents} />
