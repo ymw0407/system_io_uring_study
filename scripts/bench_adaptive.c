@@ -89,6 +89,20 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Register the fd with both rings.
+     * SQPOLL strictly required this on older kernels (<5.11) and remains
+     * the safest path on virtualized kernels. Registering both rings
+     * lets us use the same prep_read() + IOSQE_FIXED_FILE path uniformly. */
+    int reg_fds[] = { fd };
+    if (io_uring_register_files(&ring_int, reg_fds, 1) < 0) {
+        perror("io_uring_register_files (interrupt)");
+        return 1;
+    }
+    if (io_uring_register_files(&ring_poll, reg_fds, 1) < 0) {
+        perror("io_uring_register_files (polling)");
+        return 1;
+    }
+
     enum io_mode current = MODE_INTERRUPT;
     struct io_uring *active = &ring_int;
 
@@ -115,13 +129,29 @@ int main(int argc, char *argv[]) {
         struct io_uring_sqe *sqe = io_uring_get_sqe(active);
         if (!sqe) {
             struct io_uring_cqe *cqe;
-            io_uring_wait_cqe(active, &cqe);
+            int ret = io_uring_wait_cqe(active, &cqe);
+            if (ret < 0) {
+                fprintf(stderr, "wait_cqe failed: %s\n", strerror(-ret));
+                break;
+            }
             io_uring_cqe_seen(active, cqe);
             inflight--;
             sqe = io_uring_get_sqe(active);
+            if (!sqe) {
+                fprintf(stderr, "get_sqe still NULL after wait_cqe\n");
+                break;
+            }
         }
-        io_uring_prep_read(sqe, fd, buf, BS, 0);
-        io_uring_submit(active);
+        /* Use registered file index (0) with IOSQE_FIXED_FILE flag,
+         * not the raw fd. This is required because both rings have
+         * the fd registered via io_uring_register_files() above. */
+        io_uring_prep_read(sqe, 0, buf, BS, 0);
+        sqe->flags |= IOSQE_FIXED_FILE;
+        int sub = io_uring_submit(active);
+        if (sub < 0) {
+            fprintf(stderr, "submit failed: %s\n", strerror(-sub));
+            break;
+        }
         inflight++;
 
         /* Reap completions */
