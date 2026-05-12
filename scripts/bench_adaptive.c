@@ -33,6 +33,7 @@
 #define QD_THR      8
 #define COOLDOWN_MS 500
 #define RUNTIME_SEC 10    /* 시간 기반 루프 — cooldown 윈도우가 여러 번 지나도록 */
+#define CHECK_MS    200   /* 정책 체크 간격. /proc/stat 의 jiffy resolution 보다 충분히 커야 함 */
 
 struct cpu_sample {
     unsigned long long user, nice, system, idle;
@@ -47,6 +48,11 @@ static int read_cpu(struct cpu_sample *s) {
                    &s->iowait, &s->irq, &s->softirq, &s->steal);
     fclose(f);
     return (n == 8) ? 0 : -1;
+}
+
+static long ms_diff(struct timespec *a, struct timespec *b) {
+    return (b->tv_sec - a->tv_sec) * 1000L
+         + (b->tv_nsec - a->tv_nsec) / 1000000L;
 }
 
 static double calc_cpu_usage(struct cpu_sample *prev, struct cpu_sample *cur) {
@@ -122,6 +128,7 @@ int main(int argc, char *argv[]) {
 
     struct timespec run_start;
     clock_gettime(CLOCK_MONOTONIC, &run_start);
+    struct timespec last_check = run_start;  /* CPU 샘플 윈도우의 시작점 */
 
     int i = 0;
     while (1) {
@@ -178,37 +185,39 @@ int main(int argc, char *argv[]) {
             inflight--;
         }
 
-        /* Policy decision every 200 iterations */
-        if (i % 200 == 0 && i > 0) {
-            read_cpu(&cur_cpu);
-            double cpu = calc_cpu_usage(&prev_cpu, &cur_cpu);
-            prev_cpu = cur_cpu;
-
+        /* 정책 체크는 iteration 마다 가벼운 체크 후 CHECK_MS 마다만 실제 측정.
+         * 측정 윈도우가 짧으면 /proc/stat 의 jiffy 양자화로 cpu_pct 가
+         * 0% ↔ 100% 진동하는 버그를 막는다. */
+        if (i % 1000 == 0 && i > 0) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
 
             /* 전체 runtime 종료 체크 */
-            long run_elapsed_ms = (now.tv_sec - run_start.tv_sec) * 1000
-                                + (now.tv_nsec - run_start.tv_nsec) / 1000000;
-            if (run_elapsed_ms >= RUNTIME_SEC * 1000) break;
+            if (ms_diff(&run_start, &now) >= RUNTIME_SEC * 1000) break;
 
-            long elapsed_ms = (now.tv_sec - last_switch.tv_sec) * 1000
-                            + (now.tv_nsec - last_switch.tv_nsec) / 1000000;
+            /* 측정 윈도우 확보: 마지막 CPU 샘플 후 CHECK_MS 이상 경과해야 한다 */
+            if (ms_diff(&last_check, &now) < CHECK_MS) continue;
 
-            if (elapsed_ms >= COOLDOWN_MS) {
-                if (cpu > CPU_THR && current == MODE_POLLING) {
-                    current = MODE_INTERRUPT;
-                    active = &ring_int;
-                    last_switch = now;
-                    printf("[switch] -> INTERRUPT (cpu=%.1f%%)\n", cpu);
-                } else if (inflight >= QD_THR && cpu <= CPU_THR
-                           && current == MODE_INTERRUPT) {
-                    current = MODE_POLLING;
-                    active = &ring_poll;
-                    last_switch = now;
-                    printf("[switch] -> POLLING (cpu=%.1f%%, qd=%d)\n",
-                           cpu, inflight);
-                }
+            read_cpu(&cur_cpu);
+            double cpu = calc_cpu_usage(&prev_cpu, &cur_cpu);
+            prev_cpu = cur_cpu;
+            last_check = now;
+
+            /* Switch cooldown: 마지막 전환 후 COOLDOWN_MS 이상 경과해야 한다 */
+            if (ms_diff(&last_switch, &now) < COOLDOWN_MS) continue;
+
+            if (cpu > CPU_THR && current == MODE_POLLING) {
+                current = MODE_INTERRUPT;
+                active = &ring_int;
+                last_switch = now;
+                printf("[switch] -> INTERRUPT (cpu=%.1f%%)\n", cpu);
+            } else if (inflight >= QD_THR && cpu <= CPU_THR
+                       && current == MODE_INTERRUPT) {
+                current = MODE_POLLING;
+                active = &ring_poll;
+                last_switch = now;
+                printf("[switch] -> POLLING (cpu=%.1f%%, qd=%d)\n",
+                       cpu, inflight);
             }
         }
 
