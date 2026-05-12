@@ -72,8 +72,18 @@ enum io_mode { MODE_INTERRUPT, MODE_POLLING };
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <file>\n", argv[0]);
+        fprintf(stderr, "usage: %s <file> [QD]\n", argv[0]);
+        fprintf(stderr, "  QD: queue depth (default %d, max 1024)\n", QD);
         return 1;
+    }
+
+    int target_qd = QD;
+    if (argc >= 3) {
+        target_qd = atoi(argv[2]);
+        if (target_qd < 1 || target_qd > 1024) {
+            fprintf(stderr, "QD out of range: %s\n", argv[2]);
+            return 1;
+        }
     }
 
     int fd = open(argv[1], O_RDONLY | O_DIRECT);
@@ -81,7 +91,7 @@ int main(int argc, char *argv[]) {
 
     /* Initialize two rings: interrupt and polling */
     struct io_uring ring_int, ring_poll;
-    if (io_uring_queue_init(QD, &ring_int, 0) < 0) {
+    if (io_uring_queue_init(target_qd, &ring_int, 0) < 0) {
         perror("io_uring_queue_init (interrupt)");
         return 1;
     }
@@ -89,7 +99,7 @@ int main(int argc, char *argv[]) {
     struct io_uring_params p = {0};
     p.flags = IORING_SETUP_SQPOLL;
     p.sq_thread_idle = 2000;
-    if (io_uring_queue_init_params(QD, &ring_poll, &p) < 0) {
+    if (io_uring_queue_init_params(target_qd, &ring_poll, &p) < 0) {
         perror("io_uring_queue_init_params (polling)");
         io_uring_queue_exit(&ring_int);
         return 1;
@@ -125,10 +135,14 @@ int main(int argc, char *argv[]) {
     }
 
     int inflight = 0;
+    long completed_ios = 0;          /* 완료된 IO 수 (CQE 본 횟수) */
+    long polling_ns = 0;             /* POLLING 모드로 보낸 누적 ns */
+    long interrupt_ns = 0;           /* INTERRUPT 모드로 보낸 누적 ns */
 
     struct timespec run_start;
     clock_gettime(CLOCK_MONOTONIC, &run_start);
     struct timespec last_check = run_start;  /* CPU 샘플 윈도우의 시작점 */
+    struct timespec mode_start = run_start;  /* 현재 모드 진입 시점 */
 
     int i = 0;
     while (1) {
@@ -159,6 +173,7 @@ int main(int argc, char *argv[]) {
                 }
                 io_uring_cqe_seen(active, cqe);
                 inflight--;
+                completed_ios++;
             }
             sqe = io_uring_get_sqe(active);
             if (!sqe) {
@@ -183,6 +198,7 @@ int main(int argc, char *argv[]) {
         while (io_uring_peek_cqe(active, &cqe) == 0) {
             io_uring_cqe_seen(active, cqe);
             inflight--;
+            completed_ios++;
         }
 
         /* 정책 체크는 iteration 마다 가벼운 체크 후 CHECK_MS 마다만 실제 측정.
@@ -206,16 +222,24 @@ int main(int argc, char *argv[]) {
             /* Switch cooldown: 마지막 전환 후 COOLDOWN_MS 이상 경과해야 한다 */
             if (ms_diff(&last_switch, &now) < COOLDOWN_MS) continue;
 
+            /* Mode 전환 시 누적 시간 갱신 */
+            long mode_ns_diff = (now.tv_sec - mode_start.tv_sec) * 1000000000L
+                              + (now.tv_nsec - mode_start.tv_nsec);
+
             if (cpu > CPU_THR && current == MODE_POLLING) {
+                polling_ns += mode_ns_diff;
                 current = MODE_INTERRUPT;
                 active = &ring_int;
                 last_switch = now;
+                mode_start = now;
                 printf("[switch] -> INTERRUPT (cpu=%.1f%%)\n", cpu);
             } else if (inflight >= QD_THR && cpu <= CPU_THR
                        && current == MODE_INTERRUPT) {
+                interrupt_ns += mode_ns_diff;
                 current = MODE_POLLING;
                 active = &ring_poll;
                 last_switch = now;
+                mode_start = now;
                 printf("[switch] -> POLLING (cpu=%.1f%%, qd=%d)\n",
                        cpu, inflight);
             }
@@ -224,7 +248,32 @@ int main(int argc, char *argv[]) {
         i++;
     }
 
-    printf("Done after %d iterations. Final mode: %s\n", i,
+    /* Final 모드 시간 누적 */
+    struct timespec final_now;
+    clock_gettime(CLOCK_MONOTONIC, &final_now);
+    long final_mode_ns = (final_now.tv_sec - mode_start.tv_sec) * 1000000000L
+                       + (final_now.tv_nsec - mode_start.tv_nsec);
+    if (current == MODE_POLLING) polling_ns += final_mode_ns;
+    else                          interrupt_ns += final_mode_ns;
+
+    double elapsed_sec = ms_diff(&run_start, &final_now) / 1000.0;
+    double iops = (elapsed_sec > 0) ? completed_ios / elapsed_sec : 0;
+    double mbps = iops * BS / (1024.0 * 1024.0);
+    double mean_lat_us = (iops > 0) ? (1000000.0 * target_qd) / iops : 0;
+    long total_ns = polling_ns + interrupt_ns;
+    double polling_pct = (total_ns > 0) ? 100.0 * polling_ns / total_ns : 0;
+
+    /* 머신 파싱이 쉽도록 key=value 한 줄씩 출력 */
+    printf("---\n");
+    printf("QD: %d\n", target_qd);
+    printf("Iterations: %d\n", i);
+    printf("Completed IOs: %ld\n", completed_ios);
+    printf("Elapsed: %.3f s\n", elapsed_sec);
+    printf("IOPS: %.0f\n", iops);
+    printf("Throughput: %.1f MB/s\n", mbps);
+    printf("Mean latency: %.1f us\n", mean_lat_us);
+    printf("Polling fraction: %.1f %%\n", polling_pct);
+    printf("Final mode: %s\n",
            current == MODE_POLLING ? "POLLING" : "INTERRUPT");
 
     io_uring_queue_exit(&ring_int);
