@@ -358,10 +358,12 @@ fio로 interrupt와 SQPOLL 기준선을 먼저 측정하고, 이어서 adaptive 
   ]}
   xLabel="Queue Depth"
   yLabel="Latency (us)"
-  caption="QD별 평균 지연 비교: fio Interrupt / fio SQPOLL / Adaptive C (4KB randread, NVMe, 예시 데이터)"
+  caption="QD별 평균 지연 비교: fio Interrupt / fio SQPOLL / Adaptive C (4KB randread, 베어메탈 Arch 6.19, 8-core, SN950X 실측, scripts/bench_adaptive_sweep.sh)"
 />
 
-Adaptive C는 전 구간에서 fio SQPOLL과 유사한 지연을 보인다. QD=16 기준으로 fio SQPOLL이 70us, adaptive C가 73us를 기록하였고, fio interrupt의 118us와는 큰 차이가 있다. adaptive가 idle 상태에서 polling 모드를 선택하기 때문에 이 결과는 예상과 부합한다.
+이 NVMe 에서는 세 모드의 지연이 *거의 같다*. QD=16 기준 fio interrupt 48.9μs, fio SQPOLL 48.5μs, adaptive C 50.1μs 로 약 1~3% 차이. SN950X 의 디바이스 시간이 latency 의 95%+ 를 차지해서 OS path 비용이 묻히는 환경 — Part 3 에서 본 *polling 의 latency 이득 영역은 좁다* 라는 관찰이 베어메탈 데이터로 다시 확인된다.
+
+adaptive C 가 QD=1, 4 에서 fio interrupt 와 *정확히 일치*하는 것은 정책의 명백한 신호다. 이 영역에서는 `inflight < qd_lo=8` 이라 정책이 POLLING 으로 전환하지 않고 INTERRUPT 를 유지한다. QD=16 부터는 POLLING 으로 옮기지만 SQPOLL 자체의 이득이 작아 latency 차이도 작다.
 
 <Chart
   kind="bar"
@@ -374,13 +376,20 @@ Adaptive C는 전 구간에서 fio SQPOLL과 유사한 지연을 보인다. QD=1
   ]}
   xLabel="CPU Background Load"
   yLabel="Throughput (MB/s)"
-  caption="CPU 부하 단계별 처리량 비교: fio Interrupt / fio SQPOLL / Adaptive C (QD=16, 4KB randread, 예시 데이터)"
+  caption="CPU 부하 단계별 처리량 비교: fio Interrupt / fio SQPOLL / Adaptive C (QD=16, 4KB randread, 베어메탈 Arch 6.19, 8-core, SN950X 실측)"
 />
 
-Idle 상태에서 adaptive C는 560MB/s로 fio SQPOLL의 580MB/s에 근접한다. CPU 100% 부하에서는 fio SQPOLL이 340MB/s로 급락하지만, adaptive C는 405MB/s를 유지하여 fio interrupt의 380MB/s보다도 높다. adaptive가 부하를 감지하고 interrupt로 전환하되, QD가 높아 폴링이 유리한 순간에는 다시 polling으로 복귀하기 때문이다.
+여기서 adaptive 의 진짜 가치가 드러난다. Idle / 50% 부하에서 adaptive 는 1244 MB/s 로 fio SQPOLL 의 1284 와 fio interrupt 의 1268 사이에 위치한다 (정책이 시간의 ~94% 를 SQPOLL 로 보낸 결과). 그런데 *CPU 100% 부하* 에서:
+
+- fio SQPOLL 은 1284 → 531 MB/s 로 *58% 처리량 손실* — SQPOLL kthread 가 자기 코어를 stress-ng 와 경쟁하면서 polling 의 가정이 깨진 모습.
+- fio interrupt 는 1268 → 983 MB/s, 22% 손실로 견딘다.
+- **adaptive 는 1044 MB/s 로 두 모드 모두 이긴다.** 정책이 CPU 100% 를 인지하고 INTERRUPT 로 전환한 결과 (polling fraction 이 idle 94% 에서 100% 부하에선 0% 로 떨어짐).
 
 <Callout kind="checkpoint">
-Adaptive C가 idle에서 fio SQPOLL에 근접하고(560 vs 580 MB/s), CPU 100%에서 fio interrupt보다 높은 처리량을 보인다면(405 vs 380 MB/s) 정책이 동작하는 것이다.
+세 가지가 다 맞아야 정책이 동작하는 것이다.
+1. Idle 처리량이 fio SQPOLL 에 근접 (1244 ≈ 1284)
+2. CPU 100% 처리량이 fio SQPOLL 의 cliff (531) 를 *회피*하고 fio interrupt 이상 (1044 ≥ 983)
+3. Polling fraction 이 부하에 따라 갈림 (Idle 94% → CPU 100% 부하 0%)
 </Callout>
 
 두 그래프의 라인/바 사이 보간은 실제 측정 사이의 동작을 의미하지 않는다. 각 데이터 포인트는 해당 조건에서의 개별 측정값이다.

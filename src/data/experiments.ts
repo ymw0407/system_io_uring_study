@@ -143,13 +143,15 @@ export interface AdaptiveComparisonPoint {
   adaptiveC: number;     // MB/s (C 벤치마크 측정)
 }
 
-/* fioInterrupt / fioSqpoll은 fioCpuThroughput와 동일. adaptiveC는 측정 예정 placeholder.
-   adaptive 정책의 의의가 가장 잘 드러나는 곳은 100% 부하 — interrupt(1025)와
-   SQPOLL(564) 사이에서 어느 쪽으로 붙는지를 보고 싶은 구간이다. */
+/* 베어메탈 Arch (kernel 6.19, 8-core, WD SN950X) 실측 — scripts/bench_adaptive_sweep.sh.
+   Polling fraction (실측): Idle 93.9%, 50% 94.0%, 100% 0.0%.
+   정책이 idle/50% 에서는 SQPOLL 로 유지, 100% 부하 진입 시 INTERRUPT 로 전환한 결과.
+   100% 부하 구간에서 adaptive 는 SQPOLL 의 cliff(531)를 회피하고 interrupt(983)도
+   살짝 넘어선다. */
 export const adaptiveComparison: AdaptiveComparisonPoint[] = [
-  { cpuLoad: 'Idle',  fioInterrupt: 1345, fioSqpoll: 1355, adaptiveC: 1340 },
-  { cpuLoad: '50%',   fioInterrupt: 1339, fioSqpoll: 1353, adaptiveC: 1340 },
-  { cpuLoad: '100%',  fioInterrupt: 1025, fioSqpoll: 564,  adaptiveC: 1000 },
+  { cpuLoad: 'Idle',  fioInterrupt: 1268, fioSqpoll: 1284, adaptiveC: 1244 },
+  { cpuLoad: '50%',   fioInterrupt: 1270, fioSqpoll: 1283, adaptiveC: 1242 },
+  { cpuLoad: '100%',  fioInterrupt: 983,  fioSqpoll: 531,  adaptiveC: 1044 },
 ];
 
 /** QD vs Latency — adaptive C vs fio modes */
@@ -160,13 +162,16 @@ export interface AdaptiveQdPoint {
   adaptiveC: number;     // μs
 }
 
-/* fioInterrupt / fioSqpoll은 fioQdLatency와 동일 측정값. adaptiveC는 측정 예정 placeholder. */
+/* 베어메탈 Arch (kernel 6.19, 8-core, WD SN950X) 실측, 같은 sweep.
+   QD=1,4 에서 adaptive 는 정책상 INTERRUPT 유지 (qd_lo=8 못 넘김) → fioInterrupt 와 일치.
+   QD=16+ 에서는 POLLING 으로 전환하지만 SN950X 에서 polling 의 latency 이득이
+   2% 안쪽이라 세 모드가 사실상 한 곡선 위에 모인다. */
 export const adaptiveQdLatency: AdaptiveQdPoint[] = [
-  { qd: 1,   fioInterrupt: 48,  fioSqpoll: 42,  adaptiveC: 45  },
-  { qd: 4,   fioInterrupt: 45,  fioSqpoll: 43,  adaptiveC: 44  },
-  { qd: 16,  fioInterrupt: 46,  fioSqpoll: 46,  adaptiveC: 46  },
-  { qd: 64,  fioInterrupt: 120, fioSqpoll: 120, adaptiveC: 120 },
-  { qd: 256, fioInterrupt: 476, fioSqpoll: 480, adaptiveC: 478 },
+  { qd: 1,   fioInterrupt: 48.6,  fioSqpoll: 44.0,  adaptiveC: 48.9  },
+  { qd: 4,   fioInterrupt: 46.2,  fioSqpoll: 45.1,  adaptiveC: 46.2  },
+  { qd: 16,  fioInterrupt: 48.9,  fioSqpoll: 48.5,  adaptiveC: 50.1  },
+  { qd: 64,  fioInterrupt: 118.2, fioSqpoll: 126.9, adaptiveC: 118.0 },
+  { qd: 256, fioInterrupt: 472.6, fioSqpoll: 475.7, adaptiveC: 471.8 },
 ];
 
 /* ──────────────────────────────────────────────
@@ -221,30 +226,37 @@ export interface SummaryRow {
   adaptiveC: string;
 }
 
+/* 베어메탈 Arch (kernel 6.19, 8-core, SN950X) 실측 종합. */
 export const summaryTable: SummaryRow[] = [
   {
     metric: 'Avg Latency (QD=16)',
-    fioInterrupt: '118 us',
-    fioSqpoll: '70 us',
-    adaptiveC: '73 us',
+    fioInterrupt: '48.9 us',
+    fioSqpoll: '48.5 us',
+    adaptiveC: '50.1 us',
   },
   {
     metric: 'Throughput (Idle)',
-    fioInterrupt: '420 MB/s',
-    fioSqpoll: '580 MB/s',
-    adaptiveC: '560 MB/s',
+    fioInterrupt: '1268 MB/s',
+    fioSqpoll: '1284 MB/s',
+    adaptiveC: '1244 MB/s',
   },
   {
     metric: 'Throughput (CPU 100%)',
-    fioInterrupt: '380 MB/s',
-    fioSqpoll: '340 MB/s',
-    adaptiveC: '405 MB/s',
+    fioInterrupt: '983 MB/s',
+    fioSqpoll: '531 MB/s',
+    adaptiveC: '1044 MB/s',
   },
   {
-    metric: 'CPU Usage (QD=16, Idle)',
-    fioInterrupt: '~13%',
-    fioSqpoll: '~98%',
-    adaptiveC: '~35%',
+    metric: 'Polling fraction (Idle)',
+    fioInterrupt: '0%',
+    fioSqpoll: '100%',
+    adaptiveC: '~94%',
+  },
+  {
+    metric: 'Polling fraction (CPU 100%)',
+    fioInterrupt: '0%',
+    fioSqpoll: '100%',
+    adaptiveC: '~0%',
   },
   {
     metric: 'Measurement Tool',
