@@ -128,17 +128,34 @@ int main(int argc, char *argv[]) {
         /* Submit a read request */
         struct io_uring_sqe *sqe = io_uring_get_sqe(active);
         if (!sqe) {
-            struct io_uring_cqe *cqe;
-            int ret = io_uring_wait_cqe(active, &cqe);
-            if (ret < 0) {
-                fprintf(stderr, "wait_cqe failed: %s\n", strerror(-ret));
-                break;
+            /* SQ 가 가득 찼다. 두 모드의 처리가 다르다.
+             *  - SQPOLL: kthread 가 SQ 를 비워주기를 기다려야 한다
+             *            (io_uring_sqring_wait 전용 함수).
+             *  - interrupt: 완료 CQE 한 건을 대기해서 슬롯 회수.
+             */
+            int ret;
+            if (current == MODE_POLLING) {
+                ret = io_uring_sqring_wait(active);
+                if (ret < 0) {
+                    fprintf(stderr, "sqring_wait failed: %s\n", strerror(-ret));
+                    break;
+                }
+            } else {
+                struct io_uring_cqe *cqe;
+                ret = io_uring_wait_cqe(active, &cqe);
+                if (ret < 0) {
+                    fprintf(stderr, "wait_cqe failed: %s\n", strerror(-ret));
+                    break;
+                }
+                if (cqe->res < 0) {
+                    fprintf(stderr, "IO error: %s\n", strerror(-cqe->res));
+                }
+                io_uring_cqe_seen(active, cqe);
+                inflight--;
             }
-            io_uring_cqe_seen(active, cqe);
-            inflight--;
             sqe = io_uring_get_sqe(active);
             if (!sqe) {
-                fprintf(stderr, "get_sqe still NULL after wait_cqe\n");
+                fprintf(stderr, "get_sqe still NULL after wait\n");
                 break;
             }
         }

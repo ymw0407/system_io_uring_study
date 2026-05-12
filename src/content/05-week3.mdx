@@ -219,11 +219,18 @@ int main(int argc, char *argv[]) {
         /* Submit a read request */
         struct io_uring_sqe *sqe = io_uring_get_sqe(active);
         if (!sqe) {
-            struct io_uring_cqe *cqe;
-            io_uring_wait_cqe(active, &cqe);
-            io_uring_cqe_seen(active, cqe);
-            inflight--;
+            /* SQ 가 꽉 찼다. SQPOLL 에서는 sqring_wait, 일반 모드에서는
+             * wait_cqe 로 슬롯을 회수한다. */
+            if (current == MODE_POLLING) {
+                if (io_uring_sqring_wait(active) < 0) break;
+            } else {
+                struct io_uring_cqe *cqe;
+                if (io_uring_wait_cqe(active, &cqe) < 0) break;
+                io_uring_cqe_seen(active, cqe);
+                inflight--;
+            }
             sqe = io_uring_get_sqe(active);
+            if (!sqe) break;
         }
         /* registered file index (0) + IOSQE_FIXED_FILE. raw fd 안 씀. */
         io_uring_prep_read(sqe, 0, buf, BS, 0);
