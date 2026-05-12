@@ -32,6 +32,7 @@
 #define CPU_THR     70.0
 #define QD_THR      8
 #define COOLDOWN_MS 500
+#define RUNTIME_SEC 10    /* 시간 기반 루프 — cooldown 윈도우가 여러 번 지나도록 */
 
 struct cpu_sample {
     unsigned long long user, nice, system, idle;
@@ -105,7 +106,11 @@ int main(int argc, char *argv[]) {
 
     int inflight = 0;
 
-    for (int i = 0; i < 10000; i++) {
+    struct timespec run_start;
+    clock_gettime(CLOCK_MONOTONIC, &run_start);
+
+    int i = 0;
+    while (1) {
         /* Submit a read request */
         struct io_uring_sqe *sqe = io_uring_get_sqe(active);
         if (!sqe) {
@@ -134,6 +139,12 @@ int main(int argc, char *argv[]) {
 
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
+
+            /* 전체 runtime 종료 체크 */
+            long run_elapsed_ms = (now.tv_sec - run_start.tv_sec) * 1000
+                                + (now.tv_nsec - run_start.tv_nsec) / 1000000;
+            if (run_elapsed_ms >= RUNTIME_SEC * 1000) break;
+
             long elapsed_ms = (now.tv_sec - last_switch.tv_sec) * 1000
                             + (now.tv_nsec - last_switch.tv_nsec) / 1000000;
 
@@ -153,9 +164,11 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
+
+        i++;
     }
 
-    printf("Done. Final mode: %s\n",
+    printf("Done after %d iterations. Final mode: %s\n", i,
            current == MODE_POLLING ? "POLLING" : "INTERRUPT");
 
     io_uring_queue_exit(&ring_int);
