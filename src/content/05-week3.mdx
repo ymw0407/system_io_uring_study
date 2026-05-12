@@ -106,7 +106,8 @@ struct io_uring *active = &ring_int;`}
 앞서 작성한 CPU 읽기 함수와 두 링 초기화를 조합하여 전체 벤치마크 프로그램을 완성한다.
 
 <CodeBlock language="c" filename="bench_adaptive.c">
-{`#include <liburing.h>
+{`#define _GNU_SOURCE
+#include <liburing.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,11 +129,11 @@ struct cpu_sample {
 static int read_cpu(struct cpu_sample *s) {
     FILE *f = fopen("/proc/stat", "r");
     if (!f) return -1;
-    fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
-           &s->user, &s->nice, &s->system, &s->idle,
-           &s->iowait, &s->irq, &s->softirq, &s->steal);
+    int n = fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &s->user, &s->nice, &s->system, &s->idle,
+                   &s->iowait, &s->irq, &s->softirq, &s->steal);
     fclose(f);
-    return 0;
+    return (n == 8) ? 0 : -1;
 }
 
 static double calc_cpu_usage(struct cpu_sample *prev,
@@ -190,7 +191,10 @@ int main(int argc, char *argv[]) {
     clock_gettime(CLOCK_MONOTONIC, &last_switch);
 
     void *buf;
-    posix_memalign(&buf, BS, BS);
+    if (posix_memalign(&buf, BS, BS) != 0) {
+        perror("posix_memalign");
+        return 1;
+    }
 
     int inflight = 0;
 
@@ -228,21 +232,17 @@ int main(int argc, char *argv[]) {
                 (now.tv_nsec - last_switch.tv_nsec) / 1000000;
 
             if (elapsed_ms >= COOLDOWN_MS) {
-                if (cpu > CPU_THR &&
-                    current == MODE_POLLING) {
+                if (cpu > CPU_THR && current == MODE_POLLING) {
                     current = MODE_INTERRUPT;
                     active = &ring_int;
                     last_switch = now;
-                    printf("[switch] -> INTERRUPT "
-                           "(cpu=%.1f%%)\n", cpu);
-                } else if (inflight >= QD_THR &&
-                           cpu <= CPU_THR &&
-                           current == MODE_INTERRUPT) {
+                    printf("[switch] -> INTERRUPT (cpu=%.1f%%)\n", cpu);
+                } else if (inflight >= QD_THR && cpu <= CPU_THR
+                           && current == MODE_INTERRUPT) {
                     current = MODE_POLLING;
                     active = &ring_poll;
                     last_switch = now;
-                    printf("[switch] -> POLLING "
-                           "(cpu=%.1f%%, qd=%d)\n",
+                    printf("[switch] -> POLLING (cpu=%.1f%%, qd=%d)\n",
                            cpu, inflight);
                 }
             }
@@ -250,8 +250,7 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Done. Final mode: %s\n",
-           current == MODE_POLLING
-               ? "POLLING" : "INTERRUPT");
+           current == MODE_POLLING ? "POLLING" : "INTERRUPT");
 
     io_uring_queue_exit(&ring_int);
     io_uring_queue_exit(&ring_poll);
@@ -275,6 +274,10 @@ int main(int argc, char *argv[]) {
   { cmd: "dd if=/dev/zero of=testfile bs=1M count=256 oflag=direct", output: ["256+0 records in", "256+0 records out"] },
   { cmd: "sudo ./bench_adaptive testfile", output: ["[switch] -> POLLING (cpu=12.3%, qd=24)", "Done. Final mode: POLLING"] }
 ]} />
+
+<Callout kind="tip">
+위 코드를 직접 복사하면 일부 편집기에서 긴 문자열이 줄바꿈으로 깨질 수 있다. 같은 내용을 그대로 컴파일 가능한 형태로 저장한 파일이 저장소에 `scripts/bench_adaptive.c` 로 들어 있다. 복사 대신 `wget` 또는 `git clone` 으로 받으면 안전하다.
+</Callout>
 
 <Callout kind="warn">
 SQPOLL 모드는 `CAP_SYS_NICE` 권한이 필요하다. 권한 오류가 발생하면 `sudo`로 실행하거나, 커널 5.12 이상에서 `IORING_SETUP_SQPOLL`의 unprivileged 지원을 확인한다.
