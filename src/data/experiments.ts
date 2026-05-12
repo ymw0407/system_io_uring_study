@@ -39,14 +39,47 @@ export interface FioQdLatencyPoint {
   iopoll: number;    // μs
 }
 
-/* Bare-metal Arch Linux 6.19, /dev/nvme0n1 직접 read, nvme.poll_queues=4, 8-core.
-   30s × 5 QDs × 3 modes. (참고: QEMU emulated NVMe에서는 세 모드가 거의 동일한 곡선이었음.) */
+/* Bare-metal 4-core Linux, /dev/nvme0n1 직접 read, idle 시스템.
+   30s × 5 QDs × 3 modes, 4k randread, --direct=1. */
 export const fioQdLatency: FioQdLatencyPoint[] = [
-  { qd: 1,   interrupt: 48,  sqpoll: 42,  iopoll: 41  },
-  { qd: 4,   interrupt: 45,  sqpoll: 43,  iopoll: 57  },
-  { qd: 16,  interrupt: 46,  sqpoll: 46,  iopoll: 66  },
-  { qd: 64,  interrupt: 120, sqpoll: 120, iopoll: 135 },
-  { qd: 256, interrupt: 476, sqpoll: 480, iopoll: 477 },
+  { qd: 1,   interrupt: 36.3,   sqpoll: 36.5,   iopoll: 39.2   },
+  { qd: 4,   interrupt: 62.6,   sqpoll: 65.8,   iopoll: 63.0   },
+  { qd: 16,  interrupt: 138.8,  sqpoll: 131.6,  iopoll: 135.8  },
+  { qd: 64,  interrupt: 444.2,  sqpoll: 440.2,  iopoll: 431.1  },
+  { qd: 256, interrupt: 1644.6, sqpoll: 1733.5, iopoll: 1694.4 },
+];
+
+/** QD vs IOPS — fio 측정, 4KB randread, NVMe */
+export interface FioQdIopsPoint {
+  qd: number;
+  interrupt: number; // IOPS (from jobs[0].read.iops)
+  sqpoll: number;
+  iopoll: number;
+}
+
+/* 같은 실험 (4-core, /dev/nvme0n1, 30s × 5 QDs × 3 modes) 의 처리량. */
+export const fioQdIops: FioQdIopsPoint[] = [
+  { qd: 1,   interrupt: 27214,  sqpoll: 27153,  iopoll: 25255  },
+  { qd: 4,   interrupt: 63438,  sqpoll: 60577,  iopoll: 63039  },
+  { qd: 16,  interrupt: 114993, sqpoll: 121409, iopoll: 117534 },
+  { qd: 64,  interrupt: 143986, sqpoll: 145297, iopoll: 148352 },
+  { qd: 256, interrupt: 155619, sqpoll: 147651, iopoll: 151045 },
+];
+
+/** QD vs CPU usage — fio 프로세스의 usr+sys 합계 (SQPOLL kthread 별도 점유는 미포함) */
+export interface FioQdCpuPoint {
+  qd: number;
+  interrupt: number; // total CPU %
+  sqpoll: number;
+  iopoll: number;
+}
+
+export const fioQdCpu: FioQdCpuPoint[] = [
+  { qd: 1,   interrupt: 24.7, sqpoll: 100.0, iopoll: 100.1 },
+  { qd: 4,   interrupt: 28.6, sqpoll: 100.0, iopoll: 100.0 },
+  { qd: 16,  interrupt: 22.7, sqpoll: 100.0, iopoll: 100.0 },
+  { qd: 64,  interrupt: 29.2, sqpoll: 100.0, iopoll: 99.9  },
+  { qd: 256, interrupt: 36.0, sqpoll: 100.0, iopoll: 100.0 },
 ];
 
 /** CPU Load vs Throughput — fio 측정, QD=16 */
@@ -70,11 +103,11 @@ export interface FioCpuUsagePoint {
   sysCpu: number; // % (from jobs[0].sys_cpu)
 }
 
-/* Bare-metal Arch, QD=16. usr/sys는 fio 프로세스 통계만 — SQPOLL의 별도 커널 kthread는 미포함. */
+/* Bare-metal 4-core, QD=16. usr/sys는 fio 프로세스 통계만 — SQPOLL의 별도 kthread는 미포함. */
 export const fioCpuUsage: FioCpuUsagePoint[] = [
-  { mode: 'Interrupt', usrCpu: 6,   sysCpu: 19 },
+  { mode: 'Interrupt', usrCpu: 8,   sysCpu: 14 },
   { mode: 'SQPOLL',    usrCpu: 100, sysCpu: 0  },
-  { mode: 'IOPOLL',    usrCpu: 4,   sysCpu: 95 },
+  { mode: 'IOPOLL',    usrCpu: 7,   sysCpu: 93 },
 ];
 
 /* ──────────────────────────────────────────────
