@@ -39,9 +39,20 @@ export interface FioQdLatencyPoint {
   iopoll: number;    // μs
 }
 
-/* Bare-metal 4-core Linux, /dev/nvme0n1 직접 read, idle 시스템.
-   30s × 5 QDs × 3 modes, 4k randread, --direct=1. */
+/* 환경 A: Bare-metal Arch Linux, WD Black SN950X NVMe, 8-core, idle 시스템.
+   30s × 5 QDs × 3 modes, 4k randread, --direct=1, nvme.poll_queues=4. */
 export const fioQdLatency: FioQdLatencyPoint[] = [
+  { qd: 1,   interrupt: 48,  sqpoll: 42,  iopoll: 41  },
+  { qd: 4,   interrupt: 45,  sqpoll: 43,  iopoll: 57  },
+  { qd: 16,  interrupt: 46,  sqpoll: 46,  iopoll: 66  },
+  { qd: 64,  interrupt: 120, sqpoll: 120, iopoll: 135 },
+  { qd: 256, interrupt: 476, sqpoll: 480, iopoll: 477 },
+];
+
+/* 환경 B: macOS 위 QEMU/KVM 가상 환경, virtio-blk passthrough, 4-core guest, idle.
+   같은 워크로드 (30s × 5 QDs × 3 modes, 4k randread, --direct=1).
+   emulation overhead 로 디바이스 latency 자체가 baseline 보다 크게 늘어남. */
+export const fioQdLatencyQemu: FioQdLatencyPoint[] = [
   { qd: 1,   interrupt: 36.3,   sqpoll: 36.5,   iopoll: 39.2   },
   { qd: 4,   interrupt: 62.6,   sqpoll: 65.8,   iopoll: 63.0   },
   { qd: 16,  interrupt: 138.8,  sqpoll: 131.6,  iopoll: 135.8  },
@@ -57,8 +68,8 @@ export interface FioQdIopsPoint {
   iopoll: number;
 }
 
-/* 같은 실험 (4-core, /dev/nvme0n1, 30s × 5 QDs × 3 modes) 의 처리량. */
-export const fioQdIops: FioQdIopsPoint[] = [
+/* 환경 B (QEMU) — 처리량. 환경 A 의 IOPS sweep 은 미수집. */
+export const fioQdIopsQemu: FioQdIopsPoint[] = [
   { qd: 1,   interrupt: 27214,  sqpoll: 27153,  iopoll: 25255  },
   { qd: 4,   interrupt: 63438,  sqpoll: 60577,  iopoll: 63039  },
   { qd: 16,  interrupt: 114993, sqpoll: 121409, iopoll: 117534 },
@@ -74,7 +85,8 @@ export interface FioQdCpuPoint {
   iopoll: number;
 }
 
-export const fioQdCpu: FioQdCpuPoint[] = [
+/* 환경 B (QEMU) — fio 프로세스 CPU 비율 (kthread 미포함) */
+export const fioQdCpuQemu: FioQdCpuPoint[] = [
   { qd: 1,   interrupt: 24.7, sqpoll: 100.0, iopoll: 100.1 },
   { qd: 4,   interrupt: 28.6, sqpoll: 100.0, iopoll: 100.0 },
   { qd: 16,  interrupt: 22.7, sqpoll: 100.0, iopoll: 100.0 },
@@ -103,8 +115,16 @@ export interface FioCpuUsagePoint {
   sysCpu: number; // % (from jobs[0].sys_cpu)
 }
 
-/* Bare-metal 4-core, QD=16. usr/sys는 fio 프로세스 통계만 — SQPOLL의 별도 kthread는 미포함. */
+/* 환경 A (Arch + SN950X, 8-core), QD=16. usr/sys 는 fio 프로세스 통계만. */
 export const fioCpuUsage: FioCpuUsagePoint[] = [
+  { mode: 'Interrupt', usrCpu: 6,   sysCpu: 19 },
+  { mode: 'SQPOLL',    usrCpu: 100, sysCpu: 0  },
+  { mode: 'IOPOLL',    usrCpu: 4,   sysCpu: 95 },
+];
+
+/* 환경 B (QEMU on macOS, 4-core), QD=16. 값이 환경 A 와 거의 같다 —
+   polling 의 CPU 패턴은 디바이스 속도와 무관하게 항상 100% 다. */
+export const fioCpuUsageQemu: FioCpuUsagePoint[] = [
   { mode: 'Interrupt', usrCpu: 8,   sysCpu: 14 },
   { mode: 'SQPOLL',    usrCpu: 100, sysCpu: 0  },
   { mode: 'IOPOLL',    usrCpu: 7,   sysCpu: 93 },

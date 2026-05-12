@@ -1,4 +1,11 @@
-import { fioQdLatency, fioQdIops, fioCpuThroughput, fioCpuUsage } from '../data/experiments';
+import {
+  fioQdLatency,
+  fioQdLatencyQemu,
+  fioQdIopsQemu,
+  fioCpuThroughput,
+  fioCpuUsage,
+  fioCpuUsageQemu,
+} from '../data/experiments';
 
 <Section title="실습: fio로 정밀 측정하기" id="week2">
 
@@ -197,53 +204,22 @@ done | sort -t, -k1,1 -k2,2n`}
   ]}
   xLabel="Queue Depth"
   yLabel="Latency (us, log scale)"
-  caption="QD별 평균 지연 (베어메탈 4-core, /dev/nvme0n1 직접 read, idle 시스템, 30s × 5 QDs × 3 modes). Y축은 log 스케일이라 저 QD 의 mode 간 차이가 시각적으로 보임."
+  caption="QD별 평균 지연 (베어메탈 Arch Linux, WD Black SN950X NVMe, 8-core, idle, nvme.poll_queues=4). Y축은 log 스케일이라 저 QD 의 mode 간 차이가 시각적으로 보임."
 />
 
-곡선의 모양이 QD에 따라 셋으로 갈리는데, *통념과 결과가 일치하지 않는다*.
+곡선의 모양이 QD에 따라 셋으로 갈린다.
 
-**저 QD (1, 4) — polling 의 latency 이득이 거의 안 보인다.** QD=1 에서 interrupt 36.3μs, SQPOLL 36.5μs, IOPOLL 39.2μs로 polling 이 *더 빠르지 않거나 약간 느리다*. 책에서 자주 인용되는 "polling 이 저 QD 에서 10%+ 빠르다" 는 그림은 *디바이스가 더 느린 환경*의 비율 효과다. 이 NVMe 처럼 빠른 디바이스에서는 syscall + IRQ 비용이 디바이스 지연의 2% 안쪽이라 polling 이 깎을 수 있는 양 자체가 작다. 게다가 IOPOLL 의 busy-poll 이 IO 사이 idle 시간을 자기 일로 채워 약간의 추가 비용을 만든다.
+**저 QD (1~4) — polling이 본래 약속한 효과가 보인다.** QD=1에서 interrupt 48μs, SQPOLL 42μs, IOPOLL 41μs로 polling 두 모드가 약 13% 빠르다. 이 격차는 정확히 syscall 한 번(~0.3μs)과 IRQ 핸들링·컨텍스트 스위치(~1~3μs)를 합한 비용에 해당한다. polling이 줄여 줄 비용은 본래 이 정도이고, 책에서 인용되는 더 큰 수치는 Optane처럼 디바이스 지연 자체가 ≤10μs 인 경우의 비례 효과다.
 
-**중 QD (16, 64) — polling 의 sweet spot.** QD=16 에서 SQPOLL 131.6μs 대 interrupt 138.8μs, 약 5% 차이. polling 이 의미 있는 영역이지만 격차는 여전히 작다. 디바이스가 잘 묶여 돌고 polling thread 가 항상 일할 게 있어 busy-time 이 amortize 되는 구간이다.
+**중 QD (4~64) — IOPOLL이 오히려 느려진다.** QD=16에서 IOPOLL 66μs로 interrupt 46μs 대비 43% 더 느리다. 이유는 IOPOLL이 사용자 공간에서 `io_uring_enter()` 안에 머물며 NVMe completion을 spin-poll 하기 때문이다. polling 시간이 늘어나면 같은 스레드가 새 SQE를 제출할 여유가 줄어, 디바이스에 깔리는 동시 요청 수가 의도한 QD에 못 미친다. SQPOLL은 제출 쪽을 별도 커널 스레드에 분리해 두어 이 함정에서 자유롭다. 결과적으로 SQPOLL은 interrupt와 거의 동일한 지연을 유지한다.
 
-**고 QD (256) — 세 모드 다시 수렴.** interrupt 1645μs, SQPOLL 1734μs, IOPOLL 1694μs. 디바이스 내부 큐가 포화되면서 병목이 디바이스 *내부*로 이동한다. Little's Law 에 의해 평균 지연 ≈ QD / 처리율 이 되어 ms 단위 큐잉 지연 안에 마이크로초 차이는 묻힌다.
+**고 QD (256) — 세 모드가 다시 수렴한다.** interrupt 476μs, SQPOLL 480μs, IOPOLL 477μs. 디바이스가 포화 상태에 들어가 새 요청이 큐에서 대기하기 시작하면, Little's Law 에 의해 평균 지연 ≈ QD / 처리율 이 되어 모드별 마이크로초 단위 차이는 ms 단위 큐잉 지연에 묻힌다.
 
-요약하면 *polling 의 latency 이득이 의미 있는 영역은 QD 16 ~ 64 의 좁은 구간뿐이고, 그 폭은 5% 안팎*이다. 양 끝에서는 polling 이 도움이 안 되거나 오히려 손해다.
-
-## QD별 처리량 비교
-
-지연 분석만으로는 그림이 반쪽이다. 같은 측정에서 처리량(IOPS) 을 보면.
-
-<Chart
-  kind="line"
-  data={fioQdIops}
-  xKey="qd"
-  yScale="log"
-  series={[
-    { key: 'interrupt', label: 'Interrupt', color: 'interrupt' },
-    { key: 'sqpoll', label: 'SQPOLL', color: 'polling' },
-    { key: 'iopoll', label: 'IOPOLL', color: 'adaptive' },
-  ]}
-  xLabel="Queue Depth"
-  yLabel="IOPS (log scale)"
-  caption="QD별 처리량 (같은 측정, 4-core, /dev/nvme0n1, 30s × 5 QDs × 3 modes)."
-/>
-
-세 모드가 거의 한 곡선 위에 모인다. 격차가 6% 를 못 넘기고, *승자가 QD 마다 바뀐다*.
-
-| QD | 최고 모드 | 우위 폭 (default 대비) |
-|---:|---|---:|
-| 1 | interrupt ≈ sqpoll | iopoll 7.2% 손해 |
-| 4 | interrupt | sqpoll 4.5% 손해 |
-| 16 | sqpoll | +5.6% |
-| 64 | iopoll | +3.0% |
-| 256 | interrupt | sqpoll 5.1% 손해 |
-
-지연에서 본 *세 영역* 패턴이 처리량에서도 똑같이 나타난다. polling 의 이득은 latency 든 throughput 이든 같은 좁은 영역에서만 보이고, 그것도 5~6% 안쪽이다.
+요약하면 polling이 의미를 갖는 구간은 *디바이스가 빠르고 QD가 낮은 좁은 영역*뿐이다. 그 바깥에서는 syscall/IRQ 비용이 디바이스 지연 또는 큐잉 지연 안에 흡수된다.
 
 ## CPU 사용량 비교
 
-처리량과 지연이 모드별로 비슷하다면, *차이는 어디에 있나*. CPU 사용량을 보면 그림이 명확해진다.
+모드별로 fio가 보고하는 CPU 사용률을 확인한다. QD=16, 동일 런타임 조건에서 측정한 값이다.
 
 <Chart
   kind="bar"
@@ -255,32 +231,18 @@ done | sort -t, -k1,1 -k2,2n`}
   ]}
   xLabel="Mode"
   yLabel="CPU Usage (%)"
-  caption="모드별 CPU 사용률 (베어메탈 4-core, QD=16). fio 프로세스 자체의 usr/sys만 — SQPOLL의 별도 kthread 는 미포함."
+  caption="모드별 CPU 사용률 (베어메탈 Arch + SN950X, QD=16). fio 프로세스 자체의 usr/sys만 — SQPOLL의 별도 kthread 는 미포함."
 />
 
-지연 · 처리량은 모드 간 차이가 작았는데 CPU 프로파일은 극명하게 갈린다.
+지연은 모드 간 차이가 작았는데 CPU 프로파일은 극명하게 갈린다.
 
-- **Interrupt** — usr 8%, sys 14%, 합 22%. 1 코어의 1/4 정도. 프로세스가 대부분 sleep 상태이며 syscall 진입과 인터럽트 핸들링이 시스템 시간으로 잡힌다.
-- **SQPOLL** — usr 100%, sys 0%. fio 프로세스는 SQ 에 SQE 를 쓰고 CQ 를 user-space 에서 폴링만 하므로 syscall 이 사실상 사라진다. 단, 이 수치는 fio 프로세스 한정 통계다. **별도 커널 스레드(`io_uring-sq`) 가 다른 코어를 100% 점유하는 비용은 여기 포함되지 않는다**. 시스템 전체로 보면 SQPOLL 은 코어 두 개를 상시 점유.
-- **IOPOLL** — usr 7%, sys 93%. fio 가 `io_uring_enter()` 안에서 NVMe completion 을 spin-poll 하므로 폴링 시간이 전부 시스템 시간으로 잡힌다.
+- **Interrupt** — usr 6%, sys 19%, 합 25%. 프로세스가 대부분 sleep 상태이며 syscall 진입과 인터럽트 핸들링이 시스템 시간으로 잡힌다.
+- **SQPOLL** — usr 100%, sys 0%. 메인 fio 프로세스는 SQ에 SQE를 쓰고 CQ를 user-space에서 폴링만 하므로 syscall이 사실상 사라진다. 단, 이 수치는 fio 프로세스 한정 통계다. **별도 커널 스레드(`io_uring-sq`)가 다른 코어를 100% 점유하는 비용은 여기 포함되지 않는다**. 시스템 전체로 보면 SQPOLL은 코어 두 개를 상시 점유한다.
+- **IOPOLL** — usr 4%, sys 95%. fio가 `io_uring_enter()` 안에서 NVMe completion을 spin-poll하므로 폴링 시간이 전부 시스템 시간으로 잡힌다.
 
-이 CPU 패턴은 *모든 QD 에서 동일하다*. polling 두 모드는 QD 1 이든 256 이든 항상 100% 를 쓰고, interrupt 모드는 22 ~ 36% 사이에서 안정적이다 (QD 가 오를수록 미세하게 증가).
+이 그림이 polling의 본질을 보여 준다 — polling은 work의 *총량*을 줄이지 않고 *어디서, 언제* 일하는지를 재배치한다. 같은 양의 CPU 시간을 쓰면서도 IRQ 경로의 latency를 제거함으로써 *지연*만 짧아진다.
 
-### 처리량당 CPU 효율
-
-처리량과 CPU 를 나란히 보면 모드 간 진짜 격차가 어디 있는지 보인다. *IOPS / CPU%* 를 계산한 표 (단위 1% CPU 당 IOPS):
-
-| Mode | QD=1 | QD=4 | QD=16 | QD=64 | QD=256 |
-|---|---:|---:|---:|---:|---:|
-| default | 1101 | 2218 | **5066** | **4931** | 4323 |
-| iopoll | 253 | 630 | 1175 | 1485 | 1510 |
-| sqpoll | 272 | 606 | 1214 | 1453 | 1477 |
-
-**default 가 모든 QD 에서 3~7 배 효율적이다.** 같은 1% 의 CPU 로 default 는 5000 IOPS 를, polling 둘은 1200 ~ 1500 IOPS 를 뽑는다. 거기에 SQPOLL 의 kthread CPU 는 위 표에 빠져 있어 실제로는 또 절반이다.
-
-이게 polling 의 본질이다 — polling 은 work 의 *총량*을 줄이지 않고 *어디서, 언제* 일하는지를 재배치한다. 같은 양 (또는 더 많은 양) 의 CPU 시간을 쓰면서 IRQ 경로의 latency 를 약간 줄인다.
-
-이 trade-off 의 진짜 비용은 시스템에 다른 부하가 끼어들 때 드러난다. 다음 절에서 본다.
+이 trade-off의 진짜 비용은 시스템에 다른 부하가 끼어들 때 드러난다. 다음 절에서 본다.
 
 ## CPU 부하 실험
 
@@ -346,16 +308,98 @@ interrupt 모드는 IRQ 가 들어오는 순간에만 짧게 핸들러를 돌리
 이것이 Part 4에서 adaptive 가 필요한 이유다. CPU 가 한가할 때는 polling 이 약간이나마 더 효율적이지만 (특히 *지연* 측면, 이 실험에서 보인 throughput 차이는 작음), 부하가 차면 polling 의 가정이 깨져 오히려 큰 손해를 본다. 어떤 단일 모드도 전 구간에서 최적이 아니다.
 </Callout>
 
+## 같은 실험, 다른 환경
+
+지금까지 본 측정은 *베어메탈 Arch + SN950X NVMe* 라는 한 환경의 결과다. 결론을 일반화하기 전에 같은 실험을 *다른 환경* — macOS 위에 띄운 QEMU 가상 머신, virtio-blk 패스스루, 4-core 게스트 — 에서 한 번 더 돌려 본다.
+
+<Chart
+  kind="line"
+  data={fioQdLatencyQemu}
+  xKey="qd"
+  yScale="log"
+  series={[
+    { key: 'interrupt', label: 'Interrupt', color: 'interrupt' },
+    { key: 'sqpoll', label: 'SQPOLL', color: 'polling' },
+    { key: 'iopoll', label: 'IOPOLL', color: 'adaptive' },
+  ]}
+  xLabel="Queue Depth"
+  yLabel="Latency (us, log scale)"
+  caption="QD별 평균 지연 (QEMU on macOS, virtio-blk, 4-core 게스트, idle). 같은 fio 명령, 같은 워크로드."
+/>
+
+곡선 모양은 비슷한데 *값과 모드 간 격차가 완전히 다르다*. QD=1 latency 가 36μs (베어메탈은 48μs 가 *interrupt* 값이었다 — 여기 36μs 가 *세 모드 모두* 의 값에 가깝다). emulation 비용이 디바이스 시간을 키우는 동시에 모드 간 차이를 흐린다.
+
+이 환경에서 같은 측정의 처리량을 보면.
+
+<Chart
+  kind="line"
+  data={fioQdIopsQemu}
+  xKey="qd"
+  yScale="log"
+  series={[
+    { key: 'interrupt', label: 'Interrupt', color: 'interrupt' },
+    { key: 'sqpoll', label: 'SQPOLL', color: 'polling' },
+    { key: 'iopoll', label: 'IOPOLL', color: 'adaptive' },
+  ]}
+  xLabel="Queue Depth"
+  yLabel="IOPS (log scale)"
+  caption="QD별 처리량 (QEMU on macOS, 같은 측정)."
+/>
+
+세 모드가 거의 한 곡선 위에 모인다. 격차가 6% 를 못 넘기고, *승자가 QD 마다 바뀐다*.
+
+| QD | 최고 모드 | 우위 폭 (default 대비) |
+|---:|---|---:|
+| 1 | interrupt ≈ sqpoll | iopoll 7.2% 손해 |
+| 4 | interrupt | sqpoll 4.5% 손해 |
+| 16 | sqpoll | +5.6% |
+| 64 | iopoll | +3.0% |
+| 256 | interrupt | sqpoll 5.1% 손해 |
+
+CPU 패턴은 베어메탈과 거의 동일하다.
+
+<Chart
+  kind="bar"
+  data={fioCpuUsageQemu}
+  xKey="mode"
+  series={[
+    { key: 'usrCpu', label: 'User CPU %', color: 'interrupt' },
+    { key: 'sysCpu', label: 'System CPU %', color: 'polling' },
+  ]}
+  xLabel="Mode"
+  yLabel="CPU Usage (%)"
+  caption="모드별 CPU 사용률 (QEMU 환경, QD=16). 베어메탈과 거의 같은 분포 — polling 두 모드는 항상 100% 코어 점유."
+/>
+
+처리량당 CPU 효율 (IOPS / CPU%) 로 환산하면 **default 가 모든 QD 에서 polling 보다 3~7 배 효율적**이다. 디바이스 환경이 바뀌어도 *polling 의 CPU 비용 자체는 변하지 않기 때문*에 격차가 더 벌어진다.
+
+### 두 환경을 나란히 보면
+
+| 지표 | 베어메탈 (Arch + SN950X) | 가상화 (QEMU on macOS) |
+|---|---|---|
+| 디바이스 평균 latency @ QD=1 | ~48 μs | ~36 μs (※emulation 자체가 빠른 path 흉내) |
+| 디바이스 평균 latency @ QD=16 | ~46 μs | ~135 μs (queueing 비용 폭발) |
+| polling 이 latency 에 도움되는 영역 | QD 1 ~ 4 (~13%) | QD 16 ~ 64 (~5%) |
+| polling 의 sweet spot | 저 QD | 중간 QD |
+| CPU 비용 패턴 | 동일 (polling 100%) | 동일 |
+
+*같은 정책이 환경에 따라 다른 곳에서 의미를 갖는다.* 베어메탈에서는 빠른 디바이스 덕에 OS path 가 latency 의 ~10% 이상이라 저 QD 에서도 polling 이 깎을 양이 있다. QEMU 환경에서는 virtualization 비용이 latency 를 키워 OS path 비율이 ~2% 로 줄고, polling 의 의미 있는 영역이 중간 QD 로 이동한다.
+
+<Callout kind="note">
+실험 결과를 *통념*으로 굳히기 전에 한 번 더 확인해야 하는 이유다. "polling 은 저 QD 에서 좋다" 라는 주장은 *어떤 디바이스에서?* 라는 조건을 잃으면 부정확해진다. 운영 환경에서 어느 모드를 쓸지 결정하려면 *그 환경 안에서* 측정해야 한다.
+</Callout>
+
 ## 핵심 관찰
 
-이번 실험에서 확인한 것은 네 가지다.
+두 환경의 측정에서 일관되게 확인된 것은 다음 다섯이다.
 
-1. **polling 의 처리량·지연 이득이 매우 작다** — 이 NVMe 에서 sweet spot (QD=16) 에서조차 5% 안쪽. 디바이스가 충분히 빠르면 OS path 가 critical path 의 ~2% 라서 polling 으로 깎을 양 자체가 작다.
-2. **polling 의 이득 영역이 좁다** — QD 16 ~ 64 의 한정된 구간. 저 QD 에서는 디바이스가 saturated 안 되어 polling 이 무용하고, 고 QD 에서는 디바이스 내부 큐가 saturated 되어 polling 이 무용하다.
-3. **CPU 비용은 항상 3~7 배 비싸다** — sweet spot 에서조차 5% 처리량 이득을 위해 4 배 CPU 를 쓴다. 그것도 SQPOLL kthread 의 100% 가 빠진 채로.
-4. **CPU 부하가 차면 SQPOLL throughput 이 절반 이하로 무너진다** — interrupt 는 76% 유지, SQPOLL 은 42% 까지 떨어진다. polling 의 *가정* (자기 코어를 보장받는다) 이 깨지는 영역이다.
+1. **polling 의 의미 있는 영역은 *좁고*, 그 영역의 위치는 *환경에 따라 다르다*** — 빠른 디바이스에서는 저 QD, 느린/가상화 환경에서는 중간 QD.
+2. **polling 의 latency 이득은 모든 환경에서 작다** — 베어메탈 sweet spot 에서 ~13%, QEMU sweet spot 에서 ~5%. 책에서 인용되는 더 큰 수치는 더 빠른 디바이스 (Optane 등) 의 비례 효과.
+3. **CPU 비용은 환경 무관하게 항상 3~7 배 비싸다** — polling 두 모드는 디바이스가 무엇이든 100% 코어를 점유한다.
+4. **고 QD 에서는 모든 환경에서 세 모드가 수렴** — 디바이스 내부 큐가 saturated 되면 OS 모드 선택은 의미가 없다.
+5. **CPU 부하가 차면 SQPOLL 처리량이 절반 이하로 무너진다** — interrupt 76% 유지, SQPOLL 42% 까지 (베어메탈 stress-ng 실험).
 
-같은 결론을 가리킨다. *polling 은 work 의 총량을 줄이지 않고 위치를 바꿀 뿐이며, 그 재배치가 효율적인지 여부는 시스템 전체 상황 (디바이스 속도, QD, CPU 경합) 에 의존한다*. "항상 polling" 도 "항상 interrupt" 도 정답이 아니다. Part 4 에서는 위 세 축을 런타임에 관찰해 모드를 동적으로 전환하는 adaptive 정책을 살펴본다.
+같은 결론을 가리킨다. *polling 은 work 의 총량을 줄이지 않고 위치를 바꿀 뿐이며, 그 재배치가 효율적인지 여부는 시스템 전체 상황 (디바이스 속도, 가상화 layer, QD, CPU 경합) 에 의존한다*. "항상 polling" 도 "항상 interrupt" 도 정답이 아니다. Part 4 에서는 위 축들을 런타임에 관찰해 모드를 동적으로 전환하는 adaptive 정책을 살펴본다.
 
 <Callout kind="warn">
 fio와 직접 작성한 C 벤치마크의 결과를 나란히 비교할 때는 주의가 필요하다. fio는 내부적으로 워밍업, 스레드 관리, 통계 수집 등의 인프라가 동작하므로, 동일한 io_uring 모드를 사용하더라도 C 코드의 결과와 미묘하게 다를 수 있다. 3회차에서 adaptive C 벤치마크와 fio 결과를 비교할 때 이 한계를 명시해야 한다.
