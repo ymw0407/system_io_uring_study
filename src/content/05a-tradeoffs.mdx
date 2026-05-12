@@ -1,10 +1,38 @@
 <Section title="모드별 비용 구조와 전환의 기준" id="tradeoffs">
 
-앞선 측정에서 polling 과 interrupt 어느 한쪽도 모든 상황에서 최적이 아니라는 결론이 나왔다. 이 절에서는 그 관찰을 SQPOLL · IOPOLL · 둘의 조합 · 둘 다 끄기까지 네 가지 모드 전체로 확장한다. 각 모드가 어떤 비용을 지불하고 어떤 비용을 회피하는지를 분해해 어떤 상황에서 유리하고 어떤 상황에서 무너지는지 정리한다. 마지막으로 동적 전환을 만든다고 결심했을 때 *무엇을 신호로 보고 판단할 것인가*를 고찰한다.
+앞 절에서 polling 과 interrupt 둘 중 어느 쪽도 모든 상황의 정답이 아니라는 결론에 도달했다. 이번 절에서는 그 관찰을 한 단계 더 분해한다.
+
+io_uring 은 사실 *두 가지 polling 옵션*을 가지고 있고, 둘은 독립적으로 켜고 끌 수 있다. 그래서 모드 조합은 네 가지다. 각 조합이 어떤 가정 위에 서 있고, 그 가정이 언제 깨지는지, 같은 NVMe 에서 직접 측정해 어떤 모드가 어디서 의미를 가지는지 본다. 마지막으로 동적 전환 정책을 짤 때 *무엇을 신호로 봐야 하는지* 고민한다.
+
+## 처리량의 천장 — Little's Law
+
+본론에 들어가기 전에 짧은 산수를 하나 짚어 둔다. 이게 모든 분석의 출발점이 된다.
+
+폴링이든 인터럽트든 IO 처리량은 결국 *동시에 처리되는 IO 수* 와 *IO 한 건의 평균 지연*의 비율이다.
+
+**처리량 = 동시처리량 / 평균지연**
+
+이게 Little's Law 다. iodepth 16, 평균 latency 135 μs 인 워크로드라면 이론 천장은 `16 / 135μs = 118,500 IOPS`. 같은 NVMe 의 어떤 모드를 켜도, CPU 가 한가하든 말든, 이 천장을 못 넘는다.
+
+천장을 *올리려면* 분자(QD) 를 키우거나 분모(latency) 를 줄여야 한다. polling 은 latency 의 일부를 깎는 도구다. 그래서 polling 의 천장 이득은 *latency 안에서 OS path 가 차지하는 비율*에 의해 미리 정해진다.
+
+위 워크로드의 135 μs 를 분해하면 이렇게 된다.
+
+<CodeBlock language="plaintext" filename="latency-breakdown.txt">
+{`135 μs 평균 latency 분해
+  ├─ 디바이스 시간 (NAND + controller)        ≈ 130 μs   ← 96%
+  ├─ Submit path  (syscall, slat 측정)         ≈   0.9 μs ← <1%
+  ├─ Completion path (IRQ, softirq, wakeup)    ≈   2-3 μs ← ~2%
+  └─ 사용자 측 처리 (CQ 읽기, io_u 관리)       ≈   1 μs   ← <1%`}
+</CodeBlock>
+
+**polling 으로 줄일 수 있는 부분은 OS path ~3 μs, 전체의 약 2%다.** 천장을 2% 올리는 대가로 코어 하나를 헌납하는 게 합리적인지가 polling 선택의 본질적 질문이다.
+
+답은 상황마다 다르다. 이 절의 나머지는 그 "상황"이 무엇으로 갈리는지 분해하는 작업이다.
 
 ## IO 한 건의 비용 구조
 
-io_uring 으로 IO 한 건을 처리하려면 크게 두 단계가 필요하다. 앱이 SQ 링에 요청을 올리면 커널이 디바이스 큐에 전달하는 *제출 단계*가 첫 번째이고, 디바이스가 IO 를 끝내고 그 결과가 CQ 링에 도착해 앱이 가져가는 *완료 단계*가 두 번째다.
+io_uring 으로 IO 한 건을 처리하려면 두 단계가 필요하다. 앱이 SQ 링에 요청을 올리고 커널이 디바이스로 보내는 *제출* 단계, 그리고 디바이스가 IO 를 끝낸 결과가 CQ 링에 도착해 앱이 받아 가는 *완료* 단계다.
 
 <CodeBlock language="plaintext" filename="io-path.txt">
 {`앱 ──[A 작성]──> SQ ring ──[B 제출]──> block layer ──> 디바이스
@@ -14,148 +42,177 @@ io_uring 으로 IO 한 건을 처리하려면 크게 두 단계가 필요하다.
 앱 <──[F 읽기]── CQ ring <──[D 통지]──── block layer <────┘`}
 </CodeBlock>
 
-각 구간이 비용을 가진다. A · F 는 단순 메모리 쓰기/읽기라 거의 공짜다. C 는 디바이스가 결정하는 값이라 우리가 손댈 수 없다. 우리가 통제할 수 있는 것은 *B 의 제출 경로*와 *D 의 완료 통지 경로* 두 곳이다.
+A · F 는 메모리만 만지니까 거의 공짜다. C 는 우리가 손댈 수 없는 값이다. **남는 두 곳, B 와 D 가 우리가 통제할 수 있는 OS path** 다.
 
-기본 경로에서는 B 가 `io_uring_enter` syscall 한 번이고, D 가 디바이스 인터럽트다. 두 비용 모두 IO 한 건마다 한 번씩 발생하지만 *분할 상환의 양상이 다르다*. 제출 syscall 은 한 번에 N 개의 SQE 를 함께 보낼 수 있어 *batch 로 분할 상환된다*. 백만 IOPS 워크로드도 batch 크기를 1000 으로 잡으면 syscall 은 초당 천 번뿐이다.
+기본 경로에서 B 는 `io_uring_enter` syscall, D 는 디바이스 인터럽트다. 두 비용 모두 IO 한 건마다 발생하지만 *분할 상환의 양상이 정반대*다.
 
-반면 완료 인터럽트는 IO 한 건당 한 번씩 발생한다. softirq 단계에서 어느 정도 묶이긴 하지만 본질적으로 batch 가 어렵다. 그래서 *고 IOPS 환경에서 인터럽트 비용이 syscall 비용보다 더 큰 병목*이 되는 경우가 많다.
+**Submit 측은 batch 가 잘 된다.** SQ 링에 SQE 를 N 개 쌓아 두고 syscall 한 번으로 N 개를 한꺼번에 보낼 수 있다. 백만 IOPS 워크로드도 batch 크기 1000 이면 syscall 은 초당 천 번이면 끝.
 
-이 비대칭이 io_uring 의 모든 polling 옵션을 이해하는 출발점이다. 제출 측 비용은 SQPOLL 이라는 도구로 제거할 수 있고, 완료 측 비용은 IOPOLL 이라는 도구로 제거할 수 있다. 그리고 *두 결정은 서로 독립적*이다. 그래서 네 가지 조합이 나온다.
+**Completion 측은 batch 가 어렵다.** 인터럽트는 디바이스가 발생시키니까 우리가 모을 수 없다. softirq 단계에서 약간 묶이긴 해도 본질적으로 IO 한 건당 한 번이다. IOPS 가 올라갈수록 인터럽트가 syscall 보다 더 큰 짐이 된다.
 
-## 네 가지 모드와 비용 프로파일
+이 비대칭 덕에 io_uring 은 두 측을 따로 최적화할 도구를 제공한다. **제출 측 비용은 SQPOLL 로, 완료 측 비용은 IOPOLL 로 각자 끌 수 있다.** 두 결정이 독립이라서 모드 조합이 넷이 된다.
 
-### 기본 (Nothing)
+## 네 가지 모드와 각자의 가정
 
-제출은 syscall, 완료는 인터럽트. 표준 경로다.
+각 모드를 "지불/회피하는 비용" 으로 정리하기보다 *어떤 가정 위에 서 있는가* 로 보면 메커니즘이 더 명확해진다. 가정이 성립하면 이득을 보고, 가정이 깨지면 무너진다.
 
-지불하는 비용은 IO 한 건마다 발생하는 syscall 한 번과 인터럽트 한 번이다. syscall 은 batch 로 분할 상환되지만 인터럽트는 그렇지 못해 IOPS 가 올라갈수록 인터럽트 처리에 코어가 잠식된다. NUMA 머신에서 IRQ 가 다른 socket 으로 routing 되면 cache miss 와 IPI 비용이 추가로 붙는다.
+### Default (Nothing)
 
-회피하는 비용은 *추가 코어 점유 0* 이다. 디바이스 종속성도 없다. 어떤 storage 든 작동한다.
+두 polling 옵션을 모두 끈 표준 경로. 제출은 syscall, 완료는 인터럽트.
 
-유리한 환경은 두 가지다. 첫째는 *느린 디바이스* — HDD 처럼 ms 단위로 느리면 OS 의 μs 단위 오버헤드는 비례적으로 무시된다. 둘째는 *저~중 IOPS 의 다중 워크로드 환경* — 코어를 점유하지 않는 모드가 가장 잘 공존한다. 절전 측면에서도 가장 우수해서 idle 동안 코어가 저전력 상태로 들어갈 수 있다.
+**가정:** OS 비용이 디바이스 시간에 비해 작다.
 
-불리한 환경은 *빠른 NVMe + 고 IOPS* 다. 인터럽트가 코어를 잠식해 처리량이 천장을 친다.
+디바이스가 ms 단위로 느리거나 IOPS 가 충분히 낮으면 자연스럽게 성립한다. 성립하면 추가 코어 점유가 0 이고, 디바이스 종속성이 없고, 절전이 가장 잘 된다.
 
-### IOPOLL only
+깨지는 조건은 *극단적으로 빠른 디바이스 + 매우 높은 IOPS*. 수백만 IOPS 가 sustained 되면 인터럽트가 코어를 잠식한다. 다만 그 영역에 도달한 워크로드 자체가 드물다.
 
-제출은 그대로 syscall, 완료는 *사용자 스레드가 CQ 를 직접 polling* 한다. 디바이스가 인터럽트를 발생시키지 않고 NVMe poll queue 에 결과를 깔면 사용자 스레드가 spin 으로 가져간다.
+### IOPOLL only (`--hipri=1`)
 
-요구사항이 있다. NVMe 의 `nvme.poll_queues` 가 0 이 아니어야 하고 (`/etc/modprobe.d/nvme.conf`), `O_DIRECT` 가 강제되며, block layer 가 polled IO 를 지원해야 한다.
+제출은 syscall, 완료는 *사용자 스레드가 CQ 를 직접 polling*. 디바이스가 인터럽트를 안 쏘는 대신 NVMe poll queue 에 결과를 깔면 사용자 스레드가 spin 해 가져간다.
 
-지불하는 비용은 *사용자 스레드가 polling 하는 동안의 CPU 시간*이다. 이 비용은 디바이스 wait time 에 비례한다. 50μs NVMe 에서 100k IOPS 로 polling 하면 코어 5 개 분량의 CPU 가 polling 자체에 들어간다. 디바이스가 빨라지면 비용도 자동으로 줄어든다.
+**가정:** 디바이스가 충분히 빨라 polling 시간이 짧고, polling 코어를 헌납할 여유가 있다.
 
-회피하는 비용은 인터럽트 mode-switch, softirq 스케줄링, 깨어나는 데 걸리는 wake latency 다. *jitter 가 매우 낮아진다*. NUMA cross-socket 에서 IRQ routing 비용도 같이 사라진다.
+성립하면 인터럽트 mode-switch · softirq · wakeup latency 가 다 사라진다. jitter 가 매우 낮아지고, NUMA cross-socket IRQ 비용도 같이 회피된다.
 
-유리한 환경은 *빠른 NVMe + 단일 IO latency 가 결정적인 워크로드*다. DB 의 random point lookup, 실시간 트레이딩, AI 추론의 캐시 fetch 같은 경우다. CPU 에 여유가 있어 spin 코어를 헌납해도 될 때 가장 효과적이다.
+깨지는 조건은 *느린 디바이스*. ms 단위 디바이스에서 IOPOLL 은 코어를 ms 동안 점유하면서 IO 한 건만 본다. 사실상 자살. 그리고 *다른 워크로드가 CPU 를 가져가면* polling thread 의 응답이 들쭉날쭉해진다.
 
-불리한 환경은 *느린 디바이스*다. 폴링하는 시간만큼 코어를 통째로 점유하므로 ms 단위 디바이스에서 IOPOLL 은 자살에 가깝다.
+사전 조건이 있다. `nvme.poll_queues > 0`, `O_DIRECT`, block layer 의 polled IO 지원.
 
-### SQPOLL only
+### SQPOLL only (`--sqthread_poll=1`)
 
-제출은 *커널 측 kthread* 가 자동으로 한다. 사용자는 SQ 링에 entry 만 깔면 syscall 없이 IO 가 디바이스로 내려간다. 완료는 인터럽트로 들어온다.
+제출이 *커널 측 kthread* 의 일이 된다. 사용자가 SQ 링에 entry 만 깔면 kthread 가 polling 하다 발견해 디바이스로 내려보낸다. 제출 syscall 이 사라진다. 완료는 그대로 인터럽트.
 
-요구사항으로 *registered files* 가 강제된다. kthread 가 사용자의 fd table 에 직접 접근할 수 없기 때문에 미리 등록된 fd 만 다룰 수 있다.
+**가정:** kthread 가 자기 코어를 보장받는다.
 
-지불하는 비용은 *코어 1 개의 상시 점유*다. 트래픽이 0 이어도 NEED_WAKEUP 동작을 활용하지 않으면 100% busy-loop 다. 인터럽트는 그대로 남아있고, kthread 와 사용자 스레드 사이의 cache coherency 비용이 추가로 붙는다.
+성립하면 제출 syscall 비용이 완전히 제거된다. 사용자 스레드는 SQ 에 쓰는 메모리 연산만 하면 끝.
 
-회피하는 비용은 *제출 syscall 자체*다. 이게 가장 큰 이득이다. 제출 빈도가 높은 워크로드일수록 amortize 가 잘 된다.
+깨지면 cliff 가 발생한다. kthread 가 코어를 빼앗기면 SQ 를 polling 할 수 없어 *IO 제출 자체가 멈춘다*. 앞 절에서 stress-ng 100% 구간에 SQPOLL 처리량이 idle 의 42% 로 떨어진 게 정확히 이 현상이다.
 
-유리한 환경은 *높은 제출 rate 와 풍부한 코어*다. 데이터센터의 스토리지 노드, ML training 의 data loader, 작은 IO 를 폭격형으로 쏟아내는 워크로드가 여기 해당한다. 사용자 스레드가 IO 외에도 컴퓨테이션을 한다면 syscall 에서 풀려난 시간을 그쪽에 쓸 수 있어 가치가 더 커진다.
-
-불리한 환경은 두 가지다. 첫째는 *코어가 적은 시스템* — 4 코어에서 SQPOLL 한 코어 헌납은 25% 다. 둘째이자 더 중요한 것은 *다른 워크로드와 코어를 공유하는 환경*이다. SQPOLL kthread 가 자기 코어를 다른 process 에 빼앗기면 SQ 를 polling 할 수 없어 *IO 제출 자체가 멈춘다*. 처리량이 cliff 처럼 떨어진다. 앞 절에서 stress-ng 100% 부하 구간에서 SQPOLL 처리량이 idle 의 42% 까지 떨어진 것이 정확히 이 현상이다.
+사전 조건으로 *registered files* 가 강제된다. kthread 가 사용자 fd table 에 직접 접근할 수 없기 때문이다.
 
 ### IOPOLL + SQPOLL
 
-제출은 kthread, 완료는 사용자 스레드의 polling. 모든 OS 개입이 사라진다.
+제출은 kthread, 완료는 사용자 스레드의 polling. 모든 OS 개입이 사라진다. 대신 *코어 2 개를 통째로* 가져간다.
 
-지불하는 비용은 *코어 2 개의 상시 점유*다. SQPOLL kthread 와 사용자 reap 스레드가 둘 다 busy-loop 한다. NVMe poll queue · registered files 모두 필요하다.
+**가정:** 위 두 모드의 가정이 동시에 성립. 빠른 디바이스 + 코어 보장 + 두 코어를 헌납할 여유.
 
-회피하는 비용은 syscall 과 인터럽트 *둘 다*다. 이론상 OS 오버헤드 0 에 가깝다.
+성립하면 OS 오버헤드가 이론상 0 에 가깝다. 마이크로초 이하 latency, 수백만 IOPS 가 가능한 영역.
 
-유리한 환경은 매우 좁다. *수백만 IOPS · 마이크로초 이하 latency · 32+ 코어의 dedicated 머신* 정도가 합리적인 영역이다. DPDK 스타일 storage 노드, HFT, 일부 HPC 워크로드, 그리고 "io_uring 으로 X 백만 IOPS 가능"이라는 벤치마크 시연이 여기에 해당한다.
+성립 환경이 매우 좁다. DPDK 스타일 dedicated storage 노드, HFT, "io_uring 으로 X 백만 IOPS 가능" 류의 벤치마크 시연 정도. 가정 중 하나라도 깨지면 SQPOLL 만 또는 IOPOLL 만 쓰는 게 더 효율적이다.
 
-불리한 환경은 *위 조건이 안 맞는 거의 모든 환경*이다. 두 코어 헌납을 정당화하지 못하는 워크로드라면 SQPOLL 만 쓰거나 IOPOLL 만 쓰는 것이 거의 항상 더 효율적이다.
+## 실측이 보여주는 sweet spot
 
-## 상황별 매트릭스
+위 분석은 *모양*에 대한 일반론이다. 그 모양이 *이 NVMe* 에서 어떤 크기로 나타나는지는 측정해야 안다.
 
-세 축을 동시에 보면 어떤 모드가 정답인지 명확해진다. IOPS, 코어 자원의 여유, 디바이스 속도다. 디바이스 속도는 NVMe (10–100μs) 로 고정한다고 가정하면 나머지 두 축으로 다음 표가 만들어진다.
+같은 디바이스(`/dev/nvme0n1`) 에서 세 모드를 QD 1 → 256 까지 sweep 한 결과. 다른 워크로드 없는 idle 시스템에서 측정.
 
-| | 저 IOPS (~1k) | 중 IOPS (10k–100k) | 고 IOPS (500k+) |
-|---|---|---|---|
-| **CPU 여유** (격리) | Nothing | IOPOLL | SQPOLL 또는 둘 다 |
-| **CPU 부분 경합** | Nothing | Nothing | Nothing 또는 adaptive |
-| **CPU 강한 경합** | Nothing | Nothing | Nothing 만 |
+**처리량 (IOPS, 4k randread, 30 초 평균)**
 
-빈 칸이 없다. 어느 한 칸의 정답이 옆 칸에서는 차선이거나 자살이다. 그리고 *워크로드는 시간에 따라 칸을 옮겨다닌다*. 백업 시간엔 IOPS 가 폭주하고, 새벽엔 idle 이며, 오후엔 다른 서비스가 갑자기 코어를 가져간다.
+| Mode | QD=1 | QD=4 | QD=16 | QD=64 | QD=256 |
+|---|---:|---:|---:|---:|---:|
+| default | **27.2k** | **63.4k** | 115.0k | 144.0k | **155.6k** |
+| iopoll | 25.3k | 63.0k | 117.5k | **148.4k** | 151.0k |
+| sqpoll | 27.2k | 60.6k | **121.4k** | 145.3k | 147.7k |
+
+각 QD 의 *승자가 계속 바뀐다*. 그리고 어느 칸에서도 격차가 6% 를 못 넘는다. polling 의 처리량 이득은 존재할 때조차 작다.
+
+**default 대비 polling 의 처리량 변화 (%)**
+
+| Mode | QD=1 | QD=4 | QD=16 | QD=64 | QD=256 |
+|---|---:|---:|---:|---:|---:|
+| iopoll | −7.2% | −0.6% | **+2.2%** | **+3.0%** | −2.9% |
+| sqpoll | −0.2% | −4.5% | **+5.6%** | +0.9% | −5.1% |
+
+여기서 세 영역이 보인다.
+
+**저 QD (1, 4): polling 이 손해다.** 디바이스가 saturated 안 됐고, IO 사이 wait 가 길어 polling thread 가 의미 없이 spin 한다. spin 비용만 추가되어 *느려진다*.
+
+**중간 QD (16, 64): polling 의 sweet spot.** 디바이스가 잘 묶여 돌고 OS path 가 critical path 의 작은 비율이 된다. polling 으로 OS 비용을 깎으면 2~6% 이득. 단, 그 이득의 대가로 코어 하나(또는 둘) 를 헌납한다.
+
+**고 QD (256): polling 이 다시 손해.** 디바이스 내부 큐가 포화되면서 병목이 디바이스 *내부* 로 이동한다. OS 는 어차피 빠른데 polling overhead 만 추가된다.
+
+CPU 비용도 짚어 둔다.
+
+| Mode | usr+sys CPU |
+|---|---:|
+| default | ~25% (1 코어의 1/4) |
+| iopoll | ~100% (대부분 sys, 커널 poll) |
+| sqpoll | ~100% (대부분 usr, 사용자 spin) |
+
+처리량당 CPU 효율 (IOPS / CPU%) 로 환산하면 **default 가 polling 보다 3~7 배 효율적**이다. 그리고 SQPOLL 의 kthread CPU 는 fio 프로세스 통계에 안 잡혀 있어 위 표에서 빠져 있다. 실제로는 또 절반이다.
 
 <Callout kind="note">
-이 매트릭스는 NVMe 기준이라 IOPOLL 이 고려된다. SATA SSD 나 더 느린 디바이스라면 IOPOLL 칸은 모두 사라지고 Nothing vs SQPOLL 의 두 축만 남는다. 그래서 study 의 패치된 fio 에서도 우선 SQPOLL 과 Nothing 의 두 모드 사이의 전환만 다룬다.
+이 측정의 핵심은 *polling 이 무용하다*가 아니라 *polling 의 의미 있는 영역이 좁다*는 점이다. QD 16 ~ 64 사이, CPU 여유 있음, 5% 이내의 처리량 이득이 의미 있을 만큼 비싼 metric — 이 셋이 다 맞을 때 켠다. 다른 디바이스에서는 sweet spot 의 위치와 폭이 다를 수 있다. *측정해서 자기 환경의 sweet spot 을 찾는 것이 첫 단계*다.
 </Callout>
 
 ## 단일 모드의 한계
 
-위 매트릭스의 모든 칸을 한 번에 만족하는 단일 모드는 존재하지 않는다. 각 모드는 *자기에게 유리한 가정 위에 서 있고, 그 가정이 깨지면 무너진다*. SQPOLL 은 자기 코어를 보장받을 때 가장 빠르지만 코어를 빼앗기면 cliff 처럼 떨어진다. IOPOLL 은 디바이스가 빠를 때 효율적이지만 느려지면 polling 비용이 폭발한다. 기본 모드는 robust 하지만 고 IOPS 에서 인터럽트가 코어를 잠식한다.
+위 표가 직접 보여 준다. *모든 QD 에서 이기는 모드는 없다*. 각 모드는 자기 가정이 성립하는 영역에서만 우위를 가진다.
 
-이게 *한 가지 모드를 골라 평생 쓰는 것이 적절치 않은 이유*다. 환경이 변하지 않는 워크로드라면 정답을 한 번만 고르면 되지만, 현실의 시스템은 시간대마다 다른 칸에 있다. 운영자가 매번 모드를 바꿔줄 수도 없다.
+default 는 robust 하지만 sweet spot 안에서는 polling 에 약간 진다. iopoll 은 sweet spot 안에서 약간 이기지만 QD 가 양 끝에 가면 진다. sqpoll 은 같은 패턴에 *가정 깨짐의 cliff 위험*까지 더해진다.
 
-남은 길은 *시스템 상태를 관찰해 모드를 자동으로 고르게 하는 것*이다. 즉 adaptive 정책이다.
+그리고 워크로드는 시간에 따라 영역을 옮겨다닌다. 배치 작업이 들어오면 QD 가 폭증하고, 야간엔 idle 이며, 다른 서비스가 갑자기 코어를 가져가기도 한다. 운영자가 매번 모드를 바꿔 줄 수도 없다.
+
+남은 길은 *런타임 상태를 관찰해 모드를 자동으로 고르게 하는 것*이다. adaptive 정책이다.
 
 ## 전환의 기준점에 대한 고찰
 
-adaptive 정책을 짜겠다고 결심하는 순간 즉시 다음 질문이 따라온다. *무엇을 신호로 보고 결정할 것인가*. 후보가 여럿이고 각각이 측정 비용 · 노이즈 · 반응성의 trade-off 를 가진다.
+adaptive 정책을 짜겠다고 결심하는 순간 따라오는 질문. **무엇을 신호로 보고 결정할 것인가.**
 
 ### 후보 신호들
 
-가장 직관적인 후보는 *시스템 CPU 사용률*이다. `/proc/stat` 의 첫 줄을 두 시점에 읽어 idle 비율의 차이를 계산한다. 측정 비용이 낮고 의미가 명확하다. 단점은 "시스템 전체 평균"이라는 점이다 — 4 코어 중 2 코어가 100% busy 여도 평균은 50% 다. 자기 자신이 묶인 코어에 집중된 경합을 놓친다.
+**시스템 CPU 사용률.** `/proc/stat` 의 첫 줄에서 idle 비율의 시간차를 읽는다. 측정 비용이 낮고 의미가 명확하다. 단점은 시스템 전체 평균이라는 점 — 4 코어 중 2 코어가 100% busy 여도 평균은 50% 다. 자기가 묶인 코어에 집중된 경합을 놓친다.
 
-두 번째 후보는 *in-flight QD* 다. polling 의 가치는 동시에 처리되는 IO 가 많을수록 amortize 되므로 QD 가 낮으면 polling 자체의 가치가 떨어진다. 측정은 자기 io_u 카운터를 읽으면 끝이라 가장 가볍다. 단점은 instantaneous 라 노이지하고 burst 워크로드를 잘 잡지 못한다는 점이다.
+**In-flight QD.** polling 의 가치는 동시 IO 수에 비례하므로 QD 가 낮으면 가치가 떨어진다. 측정은 자기 io_u 카운터를 읽으면 끝이라 가장 가볍다. 단점은 instantaneous 라 노이지하고 burst 워크로드를 잘 잡지 못한다.
 
-세 번째 후보는 *latency* 자체다. 평균 또는 p99 가 갑자기 늘어나면 polling 이 망해가고 있다는 가장 직접적 증거다. 의미는 가장 명확하지만 *반응이 늦다* — latency 가 보일 때면 이미 처리량이 떨어진 뒤다. 측정에 IO 를 누적해야 해서 짧은 윈도우에서는 노이즈도 크다.
+**Latency 자체.** 평균이나 p99 가 갑자기 늘면 polling 이 망해 가고 있다는 가장 직접적 증거다. 의미는 명확하지만 *반응이 늦다*. latency 가 보일 시점엔 이미 처리량이 떨어진 뒤다.
 
-네 번째 후보는 *SQPOLL kthread 의 CPU 점유율*이다. polling 이 자기 코어를 빼앗기는지 *직접* 측정한다. 가장 specific 한 신호지만 측정 경로가 까다롭다. kthread 의 PID 를 추적하고 `/proc/<pid>/stat` 을 따로 읽어야 하며, kthread 자체가 마이그레이션될 수 있어 정확히 추적하기 어렵다.
+**SQPOLL kthread 의 CPU 점유율.** polling 이 자기 코어를 빼앗기는지 직접 측정한다. 가장 specific 하지만 측정 경로가 까다롭다. kthread PID 를 추적하고 `/proc/<pid>/stat` 을 따로 읽어야 한다.
 
-다섯 번째는 *디바이스 측 신호*다. NVMe 의 도어벨–완료 latency 같은 driver-level metric 을 보면 더 이른 시점에 polling 효율을 추정할 수 있다. 그러나 일반 user-space 에서 접근 가능한 metric 이 아니라 실용적이지 않다.
+**디바이스 측 신호.** NVMe 의 도어벨–완료 latency 같은 driver-level metric. 가장 이른 신호지만 user-space 에서 접근 가능한 형태가 아니라 실용적이지 않다.
 
 ### 좋은 신호의 조건
 
-위 후보들 중 어느 것을 고르든 다음 네 가지를 만족해야 한다.
+어느 후보를 고르든 다음 넷을 만족해야 한다.
 
-*측정이 가벼워야 한다.* 신호 측정 자체가 polling 의 비용에 더해지면 정책의 가치가 깎인다. /proc/stat 한 줄 읽기는 가볍지만, 매 IO 마다 latency 분포를 갱신하는 것은 비싸다.
+*측정이 가벼워야 한다.* 신호 측정 자체가 polling 비용에 더해지면 정책의 가치가 깎인다.
 
-*반응이 빨라야 한다.* burst 워크로드에서 신호를 본 시점에 이미 burst 가 끝나 있으면 의미가 없다. 1 분 평균 load average 가 이런 이유로 부적합하다.
+*반응이 빨라야 한다.* burst 를 본 시점에 burst 가 끝나 있으면 의미 없다. 1 분 평균 load average 가 이 이유로 부적합하다.
 
-*노이즈에 견뎌야 한다.* 출렁이는 신호는 cooldown 이 막아주더라도 결국 진동을 유발한다. instantaneous 측정값보다는 짧은 sliding window 평균이 안전하다.
+*노이즈에 견뎌야 한다.* 출렁이는 신호는 cooldown 으로도 결국 진동을 유발한다.
 
-*인과관계가 있어야 한다.* 신호와 결과가 우연히 상관된 정도라면 정책은 환경 변화에 망가진다. 예를 들어 "초당 page fault 수"는 CPU 경합과 상관될 수 있지만 polling 비용과의 인과관계가 약해 신뢰할 수 없다.
+*인과관계가 있어야 한다.* 우연히 상관된 정도라면 환경 변화에 망가진다.
 
-### 이 study 에서 선택한 두 신호
+### 이 study 의 선택
 
-이번 study 의 패치된 fio 는 위 후보 중 *시스템 CPU 사용률*과 *in-flight QD* 둘을 함께 본다. 두 축으로 나누는 이유는 polling 의 비용 구조 자체가 두 축에 걸쳐 있기 때문이다. polling 의 *비용*은 코어 점유에서 오므로 CPU 경합이 첫 번째 신호로 적합하고, polling 의 *가치*는 동시 처리되는 IO 수에 비례하므로 QD 가 두 번째 신호로 적합하다.
+이번 study 의 패치된 fio 는 *시스템 CPU 사용률* + *in-flight QD* 두 신호를 함께 본다. polling 의 비용 구조 자체가 두 축에 걸쳐 있어서다.
+
+- **비용 축 (CPU 사용률).** polling 의 비용은 코어 점유에서 온다. CPU 가 다른 워크로드와 경합하면 polling 의 코어 비용이 직접 손해.
+- **가치 축 (QD).** polling 의 가치는 동시 IO 수에 비례한다. QD 가 낮으면 polling 이득이 작다.
+
+판정 규칙은 단순하다.
 
 <CodeBlock language="plaintext" filename="adaptive-rule.txt">
 {`if mode == polling and cpu_pct >= cpu_hi:
     switch to interrupt
-    # polling 비용이 너무 비싸짐. 코어 양보.
-
 elif mode == interrupt and cpu_pct <= cpu_lo and qd >= qd_lo:
     switch to polling
-    # CPU 여유 회복 + 충분한 병렬성. polling 가치 회복.
-
 else:
-    keep current mode
-    # hysteresis 영역. 진동 방지.`}
+    keep current mode`}
 </CodeBlock>
 
-판정 규칙은 단순하다. CPU 사용률이 임계 이상이면 polling 비용이 너무 비싸진 것이므로 interrupt 로 떨어진다. CPU 가 한가하면서 QD 가 임계 이상이면 polling 의 가치가 회복된 것이므로 polling 으로 돌아온다. 두 조건이 겹치는 영역, 즉 CPU 도 한가하지 않고 QD 도 작지 않은 *hysteresis 구간*에서는 *현재 모드를 유지한다*. 진동을 막는 핵심 장치다.
+기본값은 `cpu_hi=70`, `cpu_lo=60`, `qd_lo=8`, `cooldown_ms=500`. cooldown 은 한 번 전환한 뒤 최소 500ms 는 어떤 신호가 와도 다시 안 바꾸게 한다. 노이즈로 인한 진동의 두 번째 안전망.
 
-기본값은 `cpu_hi=70`, `cpu_lo=cpu_hi-10=60`, `qd_lo=8`, `cooldown_ms=500` 이다. cooldown 은 한 번 전환한 뒤 최소 500ms 동안은 어떤 신호가 와도 다시 전환하지 않게 한다. 측정 노이즈로 인한 진동을 막는 두 번째 안전망이다.
+### 데이터가 정책에 던지는 시사점
 
-### 한계와 개선 방향
+위 측정 sweep 이 이 정책에 두 가지를 알려준다.
 
-이 선택에는 분명한 한계가 있다. /proc/stat 은 시스템 전체 평균을 보므로 fio 가 사용하는 코어에 집중된 경합은 신호가 약해진다. 실제로 패치된 fio 를 4 코어 중 2 코어에 묶고 stress-ng 도 같은 2 코어에 묶었을 때, 그 2 코어가 100% 가 되어도 시스템 평균은 50% 에 머물러 임계를 못 넘긴다. 이 한계를 깨려면 *fio 자신이 묶인 CPU 만* 골라서 jiffy delta 를 합산해야 한다. 즉 `sched_getaffinity` 로 affinity mask 를 얻고 그 mask 의 CPU 만 합산하는 변형이다.
+**시사점 1: QD 하한 (`qd_lo=8`) 은 잘 잡혔다.** QD ≤ 4 에서 polling 이 분명히 손해라는 게 직접 보인다. QD 가 충분히 크지 않으면 polling 으로 가지 않는 정책은 옳은 방향이다.
 
-QD 신호도 instantaneous 값이라 노이지하다. 짧은 burst 동안 QD 가 잠시 낮아지면 정책이 polling 을 떠나게 만들 수 있다. EWMA 같은 smoothing 을 추가하면 안정성이 올라가지만 동시에 반응이 느려진다. 빠르고 안정적인 두 속성을 동시에 가지는 신호는 없다.
+**시사점 2: QD *상한*도 필요하다.** QD ≥ 256 에서 polling 이 다시 손해로 돌아오는데, 현재 정책은 그걸 못 잡는다. QD 가 너무 커서 디바이스 내부 큐가 포화되면 OS 비용이 어차피 작아져 polling 이 무의미해진다. 이상적으로는 `qd_hi=128` 같은 상한을 두고 *QD ∈ [qd_lo, qd_hi] 영역에서만* polling 으로 전환하도록 정책을 확장할 여지가 있다.
 
-근본적으로 *어떤 단일 신호도 완벽하지 않다*. 정책 설계는 신호의 의미와 한계를 이해한 다음 보수적으로 임계를 잡는 것에서 시작한다. 다음 절에서는 이 두 신호와 hysteresis · cooldown 을 합쳐 실제로 작동하는 정책을 C 로 직접 구현한다.
+CPU 신호의 한계도 분명하다. `/proc/stat` 시스템 평균은 자기가 묶인 코어에 집중된 경합을 놓친다. 이걸 풀려면 *fio 자신이 묶인 CPU 만* 골라 jiffy delta 를 합산해야 한다 (`sched_getaffinity` 로 affinity mask 를 얻고 그 mask 의 CPU 만 합산). 다음 회차의 측정에서 이 한계가 직접 부딪히는 모습이 나온다.
+
+근본적으로 *어떤 단일 신호도 완벽하지 않다*. 정책 설계는 신호의 의미와 한계를 이해한 다음 보수적으로 임계를 잡는 것에서 시작한다. 다음 절에서는 위 두 신호와 hysteresis · cooldown 을 합쳐 실제 작동하는 정책을 C 로 직접 구현한다.
 
 </Section>
