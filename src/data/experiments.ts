@@ -174,6 +174,27 @@ export const adaptiveQdLatency: AdaptiveQdPoint[] = [
   { qd: 256, fioInterrupt: 472.6, fioSqpoll: 475.7, adaptiveC: 471.8 },
 ];
 
+/** QD vs IOPS — Little's Law (QD / latency) 로 latency 데이터로부터 환산.
+ * sustained target_qd 가정 하에서 실측 IOPS 와 거의 일치한다. */
+export interface AdaptiveQdIopsPoint {
+  qd: number;
+  fioInterrupt: number; // IOPS
+  fioSqpoll: number;
+  adaptiveC: number;
+}
+
+/* QD sweep IOPS — 베어메탈 Arch + SN950X 실측 (위 latency 와 같은 sweep).
+   세 모드가 QD 따라 동일하게 증가하다 QD=64 부터 plateau — 디바이스가 saturate.
+   QD=64 와 QD=256 의 IOPS 가 거의 같지만 latency 는 4 배 (118μs → 472μs):
+   추가 QD 는 처리량 안 늘리고 queueing 만 더한다 (Little's Law). */
+export const adaptiveQdIops: AdaptiveQdIopsPoint[] = [
+  { qd: 1,   fioInterrupt: 20576,  fioSqpoll: 22727,  adaptiveC: 20450  },
+  { qd: 4,   fioInterrupt: 86580,  fioSqpoll: 88692,  adaptiveC: 86580  },
+  { qd: 16,  fioInterrupt: 327198, fioSqpoll: 329897, adaptiveC: 319361 },
+  { qd: 64,  fioInterrupt: 541456, fioSqpoll: 504334, adaptiveC: 542373 },
+  { qd: 256, fioInterrupt: 541683, fioSqpoll: 538155, adaptiveC: 542602 },
+];
+
 /* ──────────────────────────────────────────────
  * Round 3.5: 패치된 fio --adaptive_mode (Phase 3, in-process self-switching)
  * 단일 fio 실행 안에서 SQPOLL ↔ interrupt를 신호 기반으로 토글.

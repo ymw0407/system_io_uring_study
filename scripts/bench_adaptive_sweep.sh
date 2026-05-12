@@ -159,6 +159,18 @@ done
 echo "];"
 
 echo
+echo "// ---- adaptiveQdIops (IOPS) — Bench/Arch 실측 ----"
+echo "export const adaptiveQdIops: AdaptiveQdIopsPoint[] = ["
+for qd in "${QDS[@]}"; do
+  int_iops=$(jq '.jobs[0].read.iops' "$OUTDIR/fio-int-qd${qd}.json")
+  sqp_iops=$(jq '.jobs[0].read.iops' "$OUTDIR/fio-sqp-qd${qd}.json")
+  adp_iops=$(grep_value "$OUTDIR/adaptive-qd${qd}.txt" "IOPS")
+  printf "  { qd: %d, fioInterrupt: %.0f, fioSqpoll: %.0f, adaptiveC: %s },\n" \
+    "$qd" "$int_iops" "$sqp_iops" "$adp_iops"
+done
+echo "];"
+
+echo
 echo "// ---- adaptiveComparison (MB/s) — Bench/Arch 실측 ----"
 echo "export const adaptiveComparison: AdaptiveComparisonPoint[] = ["
 for pair in "Idle:idle" "50%:50" "100%:100"; do
