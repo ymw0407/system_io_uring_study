@@ -321,6 +321,10 @@ int main(int argc, char *argv[]) {
 SQPOLL 모드는 `CAP_SYS_NICE` 권한이 필요하다. 권한 오류가 발생하면 `sudo`로 실행하거나, 커널 5.12 이상에서 `IORING_SETUP_SQPOLL`의 unprivileged 지원을 확인한다.
 </Callout>
 
+<Callout kind="note">
+이 bench_adaptive 의 *실측 효과* (모드별 처리량/지연 차이) 는 베어메탈 NVMe 환경에서만 의미 있게 측정된다. QEMU/KVM 같은 가상 환경에서는 Part 3 의 "왜 두 환경의 결과가 이렇게 다를까" 절에서 정리한 구조적 이유로 모드 간 차이가 측정 noise 안에 묻혀, *정책이 성공적으로 전환했는데도 처리량 변화가 안 보이는* 모습이 흔하다. 이 절의 코드는 *메커니즘 단계*에서 정책의 작동 원리를 확인하는 용도로 충분하며, 정량적 결과 해석은 측정 환경에 따라 다르게 받아들여야 한다.
+</Callout>
+
   </Step>
 </Steps>
 
