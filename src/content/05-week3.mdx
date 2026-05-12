@@ -376,14 +376,15 @@ adaptive C 가 QD=1, 4 에서 fio interrupt 와 *정확히 일치*하는 것은 
   kind="line"
   data={adaptiveQdIops}
   xKey="qd"
+  yScale="log"
   series={[
     { key: 'fioInterrupt', label: 'fio Interrupt', color: 'interrupt' },
     { key: 'fioSqpoll',    label: 'fio SQPOLL',    color: 'polling' },
     { key: 'adaptiveC',    label: 'Adaptive C',    color: 'adaptive' },
   ]}
   xLabel="Queue Depth"
-  yLabel="IOPS"
-  caption="QD별 처리량 비교 (Little's Law 로 latency 에서 환산: IOPS = QD × 10⁶ / latency μs). QD=64 와 QD=256 의 IOPS 가 거의 같다 — 디바이스가 ~540k IOPS 에서 saturate, 추가 QD 는 처리량 안 늘리고 queueing latency 만 만든다."
+  yLabel="IOPS (log scale)"
+  caption="QD별 처리량 비교 (Little's Law 로 latency 에서 환산: IOPS = QD × 10⁶ / latency μs). Y축 log scale — 저 QD 값과 plateau 가 같은 차트에서 보이도록. QD=64 와 QD=256 의 IOPS 가 거의 같다 — 디바이스가 ~540k IOPS 에서 saturate, 추가 QD 는 처리량 안 늘리고 queueing latency 만 만든다."
 />
 
 QD=1 부터 QD=64 까지는 처리량이 거의 선형으로 증가한다 (QD=1 ~20k → QD=64 ~540k). 그러나 QD=64 와 QD=256 의 IOPS 는 같은 540k 수준으로 *plateau*. 이건 디바이스 내부 큐가 saturate 된 신호다. 같은 사실이 latency 차트에서는 QD=256 의 472μs 라는 큰 값으로 나타나고, IOPS 차트에서는 평평한 plateau 로 나타난다. 두 그림은 *같은 현상의 두 측면*이다.
